@@ -1,0 +1,18 @@
+[package]
+name = "tzf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Reader for Trimble X-series .tzf laser-scan files, documented from observed file structure. WIP."
+repository = "https://github.com/cessnajim/TrimbleX9-tzf"
+
+[lib]
+name = "tzf"
+
+[[bin]]
+name = "tzfdump"
+path = "src/bin/tzfdump.rs"
+
+[dependencies]
+flate2 = "1"
+thiserror = "2"
