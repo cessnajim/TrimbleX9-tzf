@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 description = "Reader for Trimble X-series .tzf laser-scan files, documented from observed file structure. WIP."
 repository = "https://github.com/cessnajim/TrimbleX9-tzf"
+readme = "README.md"
+rust-version = "1.77"
+keywords = ["lidar", "point-cloud", "laser-scanner", "tzf", "trimble"]
+categories = ["parser-implementations", "science::geo", "command-line-utilities"]
 
 [lib]
 name = "tzf"

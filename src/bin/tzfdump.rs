@@ -42,6 +42,13 @@ fn main() -> ExitCode {
                 s[1],
                 (s[0] * m.grid_cols as f64).to_degrees()
             );
+            println!(
+                "            start HA {:.4} rad ({:.2} deg), start VA {:.4} rad ({:.2} deg from zenith)",
+                m.start_ha_rad,
+                m.start_ha_rad.to_degrees(),
+                m.start_va_rad,
+                m.start_va_rad.to_degrees()
+            );
         }
         Err(e) => println!("scan meta : <{e}>"),
     }
@@ -67,7 +74,13 @@ fn main() -> ExitCode {
                 );
             }
             *summary
-                .entry((b.component, format!("{:?}", b.kind), b.width, b.height, b.raw_size))
+                .entry((
+                    b.component,
+                    format!("{:?}", b.kind),
+                    b.width,
+                    b.height,
+                    b.raw_size,
+                ))
                 .or_default() += 1;
             total += 1;
         }

@@ -67,6 +67,8 @@ u32 range).
 |---|---|---|---|
 | 0x10 | f64 | angle step A | 7.5431e‑4 rad |
 | 0x18 | f64 | angle step B | 7.5431e‑4 rad |
+| 0x20 | f64 | VA of the first row, radians from the zenith | 0.0 (full dome); 1.47 (area scan) |
+| 0x28 | f64 | **negated** HA of the first column, radians | −3.5788 |
 | 0x30 | u32 | grid rows | 3262 |
 | 0x34 | u32 | grid cols | 8330 |
 | 0x38 | u32 | tile size | 512 |
@@ -74,6 +76,13 @@ u32 range).
 
 Consistency check: step × cols = 6.2834 rad = **360.01°**, i.e. the columns span
 one full horizontal revolution. step × rows ≈ 141°.
+
+Grid cell `(row, col)` therefore lies at VA = `m[0x20] + row × stepB` and
+HA = `(−m[0x28] + col × stepA) mod 2π`. Verified on a live instrument: an
+area scan commanded at HA 5.3588 / VA 1.1741 rad produced a file with
+`m[0x28] = −5.3588`, `m[0x20] = 1.1741`, and its content matched the
+full‑dome scan at the cell those formulas predict (within 3 cells). Area
+scans have the same layout with a smaller grid.
 
 ## Other sections (after the data region)
 - One section begins with `FF D8 FF E0 … JFIF`: an embedded preview JPEG.

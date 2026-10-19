@@ -66,7 +66,10 @@ impl Header {
     pub fn parse(data: &[u8]) -> Result<Header> {
         let end = *SECTION_POS.last().unwrap() + 8;
         if data.len() < end {
-            return Err(Error::Truncated { need: end, have: data.len() });
+            return Err(Error::Truncated {
+                need: end,
+                have: data.len(),
+            });
         }
         if data[..8] != MAGIC {
             return Err(Error::BadMagic);
@@ -74,7 +77,12 @@ impl Header {
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&data[..8]);
         let sections = SECTION_POS.iter().map(|&p| rd_u64(data, p)).collect();
-        Ok(Header { magic, word_08: rd_u32(data, 0x08), word_0c: rd_u32(data, 0x0c), sections })
+        Ok(Header {
+            magic,
+            word_08: rd_u32(data, 0x08),
+            word_0c: rd_u32(data, 0x0c),
+            sections,
+        })
     }
     /// Offset of the scan metadata block (= end of the block data region).
     pub fn meta_offset(&self) -> u64 {
@@ -92,6 +100,23 @@ pub struct ScanMeta {
     /// The two per-axis angular steps (radians). On samples they are nearly
     /// equal and `step × grid_cols ≈ 2π` (one full revolution).
     pub angle_step_rad: [f64; 2],
+    /// Horizontal angle of the first grid column (radians, in `[0, 2π)`).
+    /// Stored negated in the file.
+    pub start_ha_rad: f64,
+    /// Vertical angle of the first grid row (radians from the zenith).
+    pub start_va_rad: f64,
+}
+
+impl ScanMeta {
+    /// Horizontal angle (radians, `[0, 2π)`) of grid column `col`.
+    pub fn ha_of_col(&self, col: f64) -> f64 {
+        (self.start_ha_rad + col * self.angle_step_rad[0]).rem_euclid(std::f64::consts::TAU)
+    }
+
+    /// Vertical angle (radians from the zenith) of grid row `row`.
+    pub fn va_of_row(&self, row: f64) -> f64 {
+        self.start_va_rad + row * self.angle_step_rad[1]
+    }
 }
 
 /// How a block's payload is stored.
@@ -146,13 +171,19 @@ impl Tzf {
         // open is undefined behaviour, as with any mmap-based reader.
         let map = unsafe { Mmap::map(&file)? };
         let header = Header::parse(&map)?;
-        Ok(Tzf { storage: Storage::Mapped(map), header })
+        Ok(Tzf {
+            storage: Storage::Mapped(map),
+            header,
+        })
     }
 
     /// Open from an in-memory buffer (tests, embedded data).
     pub fn from_bytes(data: Vec<u8>) -> Result<Tzf> {
         let header = Header::parse(&data)?;
-        Ok(Tzf { storage: Storage::Owned(data), header })
+        Ok(Tzf {
+            storage: Storage::Owned(data),
+            header,
+        })
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -171,10 +202,15 @@ impl Tzf {
         let d = self.bytes();
         let m = self.header.meta_offset() as usize;
         if m + 0x40 > d.len() {
-            return Err(Error::Truncated { need: m + 0x40, have: d.len() });
+            return Err(Error::Truncated {
+                need: m + 0x40,
+                have: d.len(),
+            });
         }
         Ok(ScanMeta {
             angle_step_rad: [rd_f64(d, m + 0x10), rd_f64(d, m + 0x18)],
+            start_va_rad: rd_f64(d, m + 0x20),
+            start_ha_rad: (-rd_f64(d, m + 0x28)).rem_euclid(std::f64::consts::TAU),
             grid_rows: rd_u32(d, m + 0x30),
             grid_cols: rd_u32(d, m + 0x34),
             tile_size: rd_u32(d, m + 0x38),
@@ -190,7 +226,11 @@ impl Tzf {
     pub fn blocks(&self) -> Blocks<'_> {
         let d = self.bytes();
         let end = (self.header.meta_offset() as usize).min(d.len());
-        Blocks { d, pos: FIRST_DESCRIPTOR, end }
+        Blocks {
+            d,
+            pos: FIRST_DESCRIPTOR,
+            end,
+        }
     }
 
     /// Raw payload bytes of a block (e.g. the JPEG for a `Jpeg` block).
@@ -202,7 +242,10 @@ impl Tzf {
     /// reallocating). On success `out.len() == b.raw_size`.
     pub fn decode_into(&self, b: &Block, out: &mut Vec<u8>) -> Result<()> {
         if b.kind != BlockKind::Deflate {
-            return Err(Error::WrongKind { offset: b.descriptor, kind: b.kind });
+            return Err(Error::WrongKind {
+                offset: b.descriptor,
+                kind: b.kind,
+            });
         }
         // payload = [u32 raw size][0x78 0x01][raw deflate ...]
         let body = &self.bytes()[b.payload_start + 6..b.payload_end];
@@ -233,7 +276,9 @@ impl Tzf {
     /// Decode all points. TODO: component meaning + range scale +
     /// spherical→XYZ + leveling. See `docs/format.md`.
     pub fn points(&self) -> Result<Vec<Point>> {
-        Err(Error::Unimplemented("points: component meaning + placement + geometry (WIP)"))
+        Err(Error::Unimplemented(
+            "points: component meaning + placement + geometry (WIP)",
+        ))
     }
 }
 
@@ -347,7 +392,15 @@ mod tests {
     }
 
     /// Append one block: 60-byte descriptor + payload.
-    fn push_block(buf: &mut Vec<u8>, component: u32, tile: (u32, u32), w: u32, h: u32, raw: u32, payload: &[u8]) {
+    fn push_block(
+        buf: &mut Vec<u8>,
+        component: u32,
+        tile: (u32, u32),
+        w: u32,
+        h: u32,
+        raw: u32,
+        payload: &[u8],
+    ) {
         let comp = (payload.len() + 28) as u32;
         buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes()); // id
         for v in [200u32, 16, comp, component, tile.0, tile.1, 100, w, h, raw] {
@@ -370,7 +423,9 @@ mod tests {
             p.extend_from_slice(&deflate_raw(data));
             push_block(&mut buf, c, tile, 64, 64, raw_len as u32, &p);
         }
-        let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0xff, 0xd9];
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0xff, 0xd9,
+        ];
         push_block(&mut buf, 4, (1, 3), 64, 64, 64 * 64, &jpeg);
         let data_end = buf.len() as u64;
         buf[0x10..0x18].copy_from_slice(&data_end.to_le_bytes());
@@ -384,7 +439,10 @@ mod tests {
         let t = Tzf::from_bytes(buf).unwrap();
         let bs: Vec<Block> = t.blocks().collect();
         assert_eq!(bs.len(), 3);
-        assert_eq!(bs.iter().map(|b| b.component).collect::<Vec<_>>(), vec![1, 2, 4]);
+        assert_eq!(
+            bs.iter().map(|b| b.component).collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
         assert_eq!(bs[0].kind, BlockKind::Deflate);
         assert_eq!(bs[2].kind, BlockKind::Jpeg);
         assert_eq!((bs[0].tile_row, bs[0].tile_col), (0, 0));
@@ -395,6 +453,25 @@ mod tests {
         assert_eq!(&j[..2], &[0xff, 0xd8]);
         assert_eq!(&j[j.len() - 2..], &[0xff, 0xd9]);
         assert!(matches!(t.decode(&bs[2]), Err(Error::WrongKind { .. })));
+    }
+
+    #[test]
+    fn scan_meta_angles() {
+        let (mut buf, _) = synthetic();
+        let m = u64::from_le_bytes(buf[0x10..0x18].try_into().unwrap()) as usize;
+        let step = 1.5e-3_f64;
+        for (off, v) in [(0x10, step), (0x18, step), (0x20, 1.2), (0x28, -5.0)] {
+            buf[m + off..m + off + 8].copy_from_slice(&f64::to_le_bytes(v));
+        }
+        buf[m + 0x30..m + 0x34].copy_from_slice(&100u32.to_le_bytes());
+        buf[m + 0x34..m + 0x38].copy_from_slice(&200u32.to_le_bytes());
+        let meta = Tzf::from_bytes(buf).unwrap().scan_meta().unwrap();
+        assert_eq!((meta.grid_rows, meta.grid_cols), (100, 200));
+        assert!((meta.start_ha_rad - 5.0).abs() < 1e-12);
+        assert!((meta.va_of_row(10.0) - (1.2 + 10.0 * step)).abs() < 1e-12);
+        // 5.0 + 1000 * 1.5e-3 = 6.5 rad wraps past 2π
+        let wrapped = 6.5 - std::f64::consts::TAU;
+        assert!((meta.ha_of_col(1000.0) - wrapped).abs() < 1e-12);
     }
 
     #[test]
