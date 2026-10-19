@@ -1,60 +1,86 @@
 # Trimble X‑series `.tzf` — observed file structure
 
 These notes describe the `.tzf` scan‑file layout **as observed from the bytes of
-sample files** (an X9 scan: 83,570,701 B, 13,718,279 points). No vendor code,
-headers, or documentation were used; everything below is re‑derivable with a hex
-viewer and a DEFLATE library. Still incomplete — enough to decode patch payloads,
-not yet to emit XYZ.
-
-All integers little‑endian.
+sample files** (an X9 scan: 83,570,701 B, 13,718,279 points). Items marked
+*unknown* have not been worked out yet. All integers little‑endian.
 
 ## File header
 - `0x00`: 8‑byte magic `5e de 73 9b db 7e 79 ab`.
-- `0x08`: u32, `0x0c`: u32 (roles unconfirmed).
-- `u64` **section offsets** at `0x10, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50`. On the
-  sample these point at a metadata block and several directories near EOF; the
-  compressed patch data occupies `[0x9c, sections[0])`.
-- `0x58…0x9c`: the first patch's descriptor (see below), then the first patch.
+- `0x08`: u32, `0x0c`: u32 (roles unknown).
+- `u64` **section offsets** at `0x10, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50`.
+  `sections[0]` is the scan metadata block and also the **end of the block
+  data region**. Other sections lie after it (see below).
+- The first block descriptor starts at `0x5c`.
 
-## Patches (the scan payload)
-The scan is a spherical range‑image on a grid, tiled into **512×512 patches**.
-Each patch block is:
+## Blocks (the scan payload)
+The data region `[0x5c, sections[0])` is an unbroken sequence of blocks:
 
 ```
-[descriptor][0x78 0x01][compressed body]
+[60-byte descriptor][payload]   [60-byte descriptor][payload]   ...
 ```
 
-- The body is **raw DEFLATE**. Inflating from `marker+2` yields exactly
-  **1,048,576 bytes = 512 × 512 × 4**, clean stream‑end. (A standard zlib read
-  fails the Adler check — the `0x78 0x01` is a header‑shaped prefix only.)
-- **Descriptor** (u32s immediately preceding the marker):
-  `[id 8B][0xC8][0x10][compressedSize][patchIndex][0][0][0x64][512][512]
-  [0x100000 = uncompressed size][scale f32][hash 8B][0x100000]`.
-  `patchIndex` is sequential; the first patch is all‑zero (a no‑return region).
-- **Cells**: 4 bytes each; `0` and `0xFFFFFFFF` act as no‑data/invalid sentinels.
-- **Per‑patch interpretation varies.** Some patches read directly as small,
-  bounded range values (one sample patch: all cells 0..1952). Others read as
-  full‑range noise unless first un‑transformed — those use a **byte‑plane
-  shuffle + delta** before deflate (a naive un‑shuffle/un‑delta corrupts a plain
-  patch, confirming the transform is per‑patch, not global). A third form is
-  Snappy‑compressed. Total patch streams ≈ 3× the patch‑position count, so each
-  grid position carries multiple planes (range + intensity + an overview level).
+**Descriptor** (offsets relative to the descriptor start):
+
+| off | type | field | sample value |
+|---|---|---|---|
+| 0  | u64 | id | constant within a file |
+| 8  | u32 | tag | 200 |
+| 12 | u32 | tag | 16 |
+| 16 | u32 | **length L** | payload length = L − 28 |
+| 20 | u32 | **component** | 1..4 |
+| 24 | u32 | **tile row** | 0..6 |
+| 28 | u32 | **tile col** | 0..16 |
+| 32 | u32 | tag | 100 |
+| 36 | u32 | **width** | 512 |
+| 40 | u32 | **height** | 512 |
+| 44 | u32 | **raw size** | decoded bytes (width × height × bytes/px) |
+| 48 | f32 | scale | varies (role unknown) |
+| 52 | u64 | hash | varies |
+
+The next descriptor begins immediately after the payload, so the region can be
+walked deterministically. On the sample the walk visits **476 blocks** and ends
+exactly at `sections[0]`.
+
+**Payload kinds** (by first bytes):
+- **Deflate** — `[u32 raw size][0x78 0x01][raw DEFLATE …]`. Inflating the raw
+  DEFLATE stream yields exactly `raw size` bytes (a standard zlib read fails the
+  checksum; treat the `0x78 0x01` as a fixed prefix). Components 1, 2, 3:
+  512×512×4 = 1,048,576 bytes each.
+- **JPEG** — a baseline JPEG (`FF D8 FF E0 … JFIF … FF D9`). Component 4:
+  512×512, 8‑bit (raw size 262,144).
+
+**Tiling.** The grid is 3262 × 8330 cells, so ⌈3262/512⌉ × ⌈8330/512⌉ =
+7 × 17 = 119 tiles. Each descriptor carries its tile's (row, col). On the sample,
+all 119 (row, col) pairs occur, each with exactly one block of every component
+1–4 (476 blocks). Tiles appear in column‑major order (row varies fastest); the
+order of components within a tile varies. Tile (r, c) covers grid rows
+`512·r … 512·r+511` and columns `512·c … 512·c+511`, clipped at the grid edge.
+
+**Cells** in components 1–3 are 4 bytes. `0` and `0xFFFFFFFF` appear as
+no‑data values. The meaning of each of components 1–3 is *unknown* (one sample
+tile of component 2 holds small bounded values 0..1952; others span the full
+u32 range).
 
 ## Metadata block (at `sections[0]`)
-Holds the calibration. Observed fields: grid **≈ 8330 cols × 3262 rows**, two
-near‑equal `f64` angular steps **≈ 7.56e‑4 rad** (one per axis), the point count
-(`13,718,279`), and the patch size (`512`).
 
-## Other sections (near EOF)
-- One section begins with `FF D8 FF E0 … JFIF` — an embedded **preview JPEG**.
-- One is a **patch directory** whose header carries a patch‑position count.
-- One indexes the trailing meta chunks; another is an `f32` per‑scanline array.
+| off | type | field | sample value |
+|---|---|---|---|
+| 0x10 | f64 | angle step A | 7.5431e‑4 rad |
+| 0x18 | f64 | angle step B | 7.5431e‑4 rad |
+| 0x30 | u32 | grid rows | 3262 |
+| 0x34 | u32 | grid cols | 8330 |
+| 0x38 | u32 | tile size | 512 |
+| 0x3c | u32 | point count | 13,718,279 |
+
+Consistency check: step × cols = 6.2834 rad = **360.01°**, i.e. the columns span
+one full horizontal revolution. step × rows ≈ 141°.
+
+## Other sections (after the data region)
+- One section begins with `FF D8 FF E0 … JFIF`: an embedded preview JPEG.
+- Others hold small directories and an `f32` array; their roles are *unknown*.
 
 ## Still to work out (for XYZ)
-1. Which patch streams are the full‑res **range** planes vs intensity/overview,
-   and the per‑patch transform (plain / shuffle+delta / snappy) — selected by a
-   descriptor field. Validation: valid range cells should total the point count.
-2. The range **scale** (cell value → metres).
-3. Each patch's (row, col) **placement** in the grid.
-4. Spherical `(range, col·step_h, row·step_v)` → XYZ, then the leveling/tilt
-   correction, and export to LAS/PLY.
+1. What each of components 1–3 encodes, and the cell → range scale.
+2. Grid cell → (horizontal angle, vertical angle) origin and direction, then
+   spherical → XYZ and any leveling correction, and export to LAS/PLY.
+3. Cell order inside a 512×512 tile (row‑major is assumed; unconfirmed).

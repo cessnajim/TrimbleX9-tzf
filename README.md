@@ -2,39 +2,53 @@
 
 A Rust reader for **Trimble X‑series `.tzf`** terrestrial‑laser‑scan files (X7/X9).
 The format is documented from the **observable byte structure** of `.tzf` files
-(`docs/format.md`) — a spherical range‑image on a grid, tiled into 512×512
-patches, each independently compressed, convertible to XYZ via the grid's
-angular step plus a tilt correction.
+in `docs/format.md`. A scan's data region is a sequence of blocks, each a
+60‑byte descriptor plus a payload, tiling a 512×512 grid with several
+components per tile.
 
 Independent interoperability project, documented from the files themselves. It
 contains no vendor source, firmware, or binaries, and is **not affiliated with
 or endorsed by Trimble Inc.**; "Trimble", "X7", "X9" are trademarks of their
 respective owners.
 
-## Status — work in progress
+## Status: work in progress
 
 | Piece | State |
 |---|---|
-| File header + `u64` section table | ✅ parsed (`Header::parse`, `tzfdump`) |
-| Patch decode (`[0x78 0x01]` → raw‑deflate → 512×512×4) | ✅ `decode_patch` / `patch_streams` |
-| Scan calibration (grid, angular step, point count) | 🟡 located; field offsets being confirmed |
-| Per‑patch pixel/plane layout + transforms (plain / shuffle+delta / snappy) | ⬜ TODO |
-| Patch placement + range scale | ⬜ TODO |
-| Spherical → XYZ + tilt, LAS/PLY export | ⬜ TODO |
+| File header + section table | ✅ `Header::parse` |
+| Scan metadata (grid, angle steps, tile size, point count) | ✅ `Tzf::scan_meta` |
+| Deterministic block walk (lazy, allocation‑free) | ✅ `Tzf::blocks` |
+| Tile placement (row, col per block) | ✅ `Block::tile_row` / `tile_col` |
+| Block decode (raw‑deflate 512×512×4; JPEG payloads) | ✅ `Tzf::decode` / `decode_into` / `payload` |
+| Meaning of components 1–3, range scale | ⬜ TODO |
+| Spherical → XYZ, LAS/PLY export | ⬜ TODO |
 
 Until the decode path lands, `Tzf::points()` returns `Error::Unimplemented`.
+
+**Memory:** files are memory‑mapped and blocks decode on demand into a reusable
+buffer, so working memory is about one decoded block (1 MiB) plus the mapped
+pages actually read. This keeps a Raspberry Pi in budget.
 
 ## Use
 
 ```bash
-cargo run --bin tzfdump -- scan.tzf            # header + sections
-cargo run --bin tzfdump -- scan.tzf --patches  # locate + decode patch streams
+cargo run --bin tzfdump -- scan.tzf            # header, sections, scan metadata
+cargo run --bin tzfdump -- scan.tzf --blocks   # block summary (decodes nothing)
+cargo run --bin tzfdump -- scan.tzf --verify   # decode every block once
 cargo test
 ```
 
 ```rust
-let tzf = tzf::Tzf::open(std::path::Path::new("scan.tzf"))?;
-println!("{} patch streams", tzf.patch_streams().len());
+use tzf::{BlockKind, Tzf};
+
+let tzf = Tzf::open(std::path::Path::new("scan.tzf"))?;
+let meta = tzf.scan_meta()?;
+println!("{}x{} grid, {} points", meta.grid_rows, meta.grid_cols, meta.n_points);
+
+let mut buf = Vec::new();
+for b in tzf.blocks().filter(|b| b.kind == BlockKind::Deflate) {
+    tzf.decode_into(&b, &mut buf)?; // buf.len() == 512*512*4
+}
 ```
 
 ## License

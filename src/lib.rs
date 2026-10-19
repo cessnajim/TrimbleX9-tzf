@@ -4,16 +4,22 @@
 //! of `.tzf` files (see `docs/format.md`); this project contains no vendor code
 //! and is not affiliated with the manufacturer.
 //!
-//! A scan is a spherical range‑image on a grid, split into 512×512 **patches**,
-//! each independently compressed. Points are polar (range + two angles) and
-//! convert to XYZ via the grid's angular step plus a leveling/tilt correction.
+//! A scan's data region is a sequence of **blocks**. Each block is a 60‑byte
+//! descriptor followed by its payload; blocks tile the scan grid in 512×512
+//! tiles, with several **components** per tile (on sample files: components
+//! 1–3 are raw‑DEFLATE 512×512×4 payloads, component 4 is a 512×512 JPEG).
 //!
-//! STATUS: **work in progress.** Header + section‑table parsing is implemented
-//! and reliable, and patch payloads decode (raw‑deflate → 512×512×4). The
-//! per‑patch pixel/plane layout, range scale, patch placement, and
-//! spherical→XYZ + tilt are still being worked out, so `points()` returns
-//! [`Error::Unimplemented`] for now.
+//! The file is memory‑mapped and [`Tzf::blocks`] is a lazy, allocation‑free
+//! iterator; payloads are only decompressed when you ask for one.
+//!
+//! STATUS: **work in progress.** Header, metadata, block walk, tile placement
+//! and block decode are implemented. The meaning of components 1–3, the range
+//! scale and spherical→XYZ are still being worked out, so [`Tzf::points`]
+//! returns [`Error::Unimplemented`].
 
+use memmap2::Mmap;
+use std::fs::File;
+use std::path::Path;
 use thiserror::Error;
 
 /// File magic (first 8 bytes), as observed.
@@ -22,8 +28,11 @@ pub const MAGIC: [u8; 8] = [0x5e, 0xde, 0x73, 0x9b, 0xdb, 0x7e, 0x79, 0xab];
 /// Byte positions of the `u64` section offsets in the file header.
 pub const SECTION_POS: [usize; 7] = [0x10, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50];
 
-/// Uncompressed size of one patch payload: 512 × 512 × 4 bytes.
-pub const PATCH_BYTES: usize = 512 * 512 * 4;
+/// Offset of the first block descriptor.
+pub const FIRST_DESCRIPTOR: usize = 0x5c;
+
+/// Size of a block descriptor, in bytes.
+pub const DESCRIPTOR_LEN: usize = 60;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -35,22 +44,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("decompress: {0}")]
     Decompress(String),
+    #[error("block at 0x{offset:x} is {kind:?}, not decodable as deflate")]
+    WrongKind { offset: usize, kind: BlockKind },
     #[error("not implemented yet: {0}")]
     Unimplemented(&'static str),
 }
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Per‑patch compression, named for the observed transform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Codec {
-    /// Raw DEFLATE (a `0x78 0x01` marker prefixes the stream, but the body is
-    /// raw deflate — a zlib read fails the trailing checksum).
-    Deflate,
-    /// Byte‑plane shuffle + delta, then DEFLATE (seen on some patches).
-    ShuffleDeltaDeflate,
-    /// Snappy.
-    Snappy,
-}
 
 /// Parsed file header.
 #[derive(Debug, Clone)]
@@ -59,7 +58,7 @@ pub struct Header {
     pub word_08: u32,
     pub word_0c: u32,
     /// `u64` section offsets (see [`SECTION_POS`]); the first is the scan
-    /// metadata block, others (near EOF) hold directories and a preview image.
+    /// metadata block, which also marks the end of the block data region.
     pub sections: Vec<u64>,
 }
 
@@ -77,128 +76,334 @@ impl Header {
         let sections = SECTION_POS.iter().map(|&p| rd_u64(data, p)).collect();
         Ok(Header { magic, word_08: rd_u32(data, 0x08), word_0c: rd_u32(data, 0x0c), sections })
     }
-    /// Offset of the scan metadata block (first section).
-    pub fn meta_offset(&self) -> u64 { self.sections[0] }
+    /// Offset of the scan metadata block (= end of the block data region).
+    pub fn meta_offset(&self) -> u64 {
+        self.sections[0]
+    }
 }
 
-/// Scan calibration needed to turn the range‑image into XYZ. Field positions in
-/// the metadata block are still being confirmed; observed on a sample: grid
-/// ≈ 8330×3262, angular step ≈ 7.56e‑4 rad in both axes.
+/// Scan calibration from the metadata block.
 #[derive(Debug, Clone)]
 pub struct ScanMeta {
-    pub grid_cols: u32,
     pub grid_rows: u32,
-    pub step_h_rad: f64,
-    pub step_v_rad: f64,
-    pub n_points: u64,
-    pub patch_size: u32,
+    pub grid_cols: u32,
+    pub tile_size: u32,
+    pub n_points: u32,
+    /// The two per-axis angular steps (radians). On samples they are nearly
+    /// equal and `step × grid_cols ≈ 2π` (one full revolution).
+    pub angle_step_rad: [f64; 2],
+}
+
+/// How a block's payload is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// `[u32 raw size][0x78 0x01][raw DEFLATE]` — decode with [`Tzf::decode`].
+    Deflate,
+    /// A baseline JPEG (`FF D8 FF …`) — read with [`Tzf::payload`].
+    Jpeg,
+    /// Anything else (not seen on samples).
+    Unknown,
+}
+
+/// One block, located from its descriptor. Cheap to copy; holds no payload.
+#[derive(Debug, Clone, Copy)]
+pub struct Block {
+    /// Offset of the descriptor.
+    pub descriptor: usize,
+    /// Payload byte range `[payload_start, payload_end)`.
+    pub payload_start: usize,
+    pub payload_end: usize,
+    /// Component number within a tile (1..=4 on samples).
+    pub component: u32,
+    /// Tile position in the scan grid (each tile is `width × height` cells).
+    pub tile_row: u32,
+    pub tile_col: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Declared decoded size in bytes (e.g. 512×512×4, or 512×512 for JPEG).
+    pub raw_size: u32,
+    /// Per-block `f32` from the descriptor (role unconfirmed).
+    pub scale: f32,
+    pub kind: BlockKind,
+}
+
+enum Storage {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+/// An open `.tzf` file (memory-mapped).
+pub struct Tzf {
+    storage: Storage,
+    header: Header,
+}
+
+impl Tzf {
+    /// Memory-map and open a file. Nothing is decompressed up front.
+    pub fn open(path: &Path) -> Result<Tzf> {
+        let file = File::open(path)?;
+        // SAFETY: the mapping is read-only; mutating the file while it is
+        // open is undefined behaviour, as with any mmap-based reader.
+        let map = unsafe { Mmap::map(&file)? };
+        let header = Header::parse(&map)?;
+        Ok(Tzf { storage: Storage::Mapped(map), header })
+    }
+
+    /// Open from an in-memory buffer (tests, embedded data).
+    pub fn from_bytes(data: Vec<u8>) -> Result<Tzf> {
+        let header = Header::parse(&data)?;
+        Ok(Tzf { storage: Storage::Owned(data), header })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match &self.storage {
+            Storage::Mapped(m) => m,
+            Storage::Owned(v) => v,
+        }
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Parse the scan metadata block.
+    pub fn scan_meta(&self) -> Result<ScanMeta> {
+        let d = self.bytes();
+        let m = self.header.meta_offset() as usize;
+        if m + 0x40 > d.len() {
+            return Err(Error::Truncated { need: m + 0x40, have: d.len() });
+        }
+        Ok(ScanMeta {
+            angle_step_rad: [rd_f64(d, m + 0x10), rd_f64(d, m + 0x18)],
+            grid_rows: rd_u32(d, m + 0x30),
+            grid_cols: rd_u32(d, m + 0x34),
+            tile_size: rd_u32(d, m + 0x38),
+            n_points: rd_u32(d, m + 0x3c),
+        })
+    }
+
+    /// Lazily walk every block in the data region `[FIRST_DESCRIPTOR,
+    /// meta_offset)`. Deterministic: each descriptor gives its payload length,
+    /// and the next descriptor starts where the payload ends. If a descriptor
+    /// fails validation the iterator resynchronises by scanning forward for the
+    /// next structurally valid one. Allocates nothing.
+    pub fn blocks(&self) -> Blocks<'_> {
+        let d = self.bytes();
+        let end = (self.header.meta_offset() as usize).min(d.len());
+        Blocks { d, pos: FIRST_DESCRIPTOR, end }
+    }
+
+    /// Raw payload bytes of a block (e.g. the JPEG for a `Jpeg` block).
+    pub fn payload(&self, b: &Block) -> &[u8] {
+        &self.bytes()[b.payload_start..b.payload_end]
+    }
+
+    /// Decode a `Deflate` block into `out` (reused across calls to avoid
+    /// reallocating). On success `out.len() == b.raw_size`.
+    pub fn decode_into(&self, b: &Block, out: &mut Vec<u8>) -> Result<()> {
+        if b.kind != BlockKind::Deflate {
+            return Err(Error::WrongKind { offset: b.descriptor, kind: b.kind });
+        }
+        // payload = [u32 raw size][0x78 0x01][raw deflate ...]
+        let body = &self.bytes()[b.payload_start + 6..b.payload_end];
+        out.clear();
+        out.resize(b.raw_size as usize, 0);
+        let mut dec = flate2::Decompress::new(false);
+        let st = dec
+            .decompress(body, out, flate2::FlushDecompress::Finish)
+            .map_err(|e| Error::Decompress(e.to_string()))?;
+        if st != flate2::Status::StreamEnd || dec.total_out() as usize != out.len() {
+            return Err(Error::Decompress(format!(
+                "block at 0x{:x}: inflated {} of {} bytes",
+                b.descriptor,
+                dec.total_out(),
+                out.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Decode a `Deflate` block into a fresh buffer.
+    pub fn decode(&self, b: &Block) -> Result<Vec<u8>> {
+        let mut v = Vec::new();
+        self.decode_into(b, &mut v)?;
+        Ok(v)
+    }
+
+    /// Decode all points. TODO: component meaning + range scale +
+    /// spherical→XYZ + leveling. See `docs/format.md`.
+    pub fn points(&self) -> Result<Vec<Point>> {
+        Err(Error::Unimplemented("points: component meaning + placement + geometry (WIP)"))
+    }
 }
 
 /// A decoded point (metres, scanner frame) with intensity.
 #[derive(Debug, Clone, Copy)]
-pub struct Point { pub x: f32, pub y: f32, pub z: f32, pub intensity: f32 }
-
-/// A located, decoded patch stream.
-#[derive(Clone)]
-pub struct PatchStream {
-    /// File offset of the `0x78 0x01` marker.
-    pub offset: usize,
-    /// Compressed size (including the 2‑byte marker).
-    pub comp_size: usize,
-    /// The 1,048,576‑byte inflated payload.
-    pub raw: Vec<u8>,
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub intensity: f32,
 }
 
-/// Open a `.tzf` file (reads it fully into memory) and parse the header.
-pub struct Tzf { pub data: Vec<u8>, pub header: Header }
+/// Lazy block iterator returned by [`Tzf::blocks`].
+pub struct Blocks<'a> {
+    d: &'a [u8],
+    pos: usize, // offset of the next descriptor
+    end: usize, // end of the data region
+}
 
-impl Tzf {
-    pub fn open(path: &std::path::Path) -> Result<Tzf> {
-        let data = std::fs::read(path)?;
-        let header = Header::parse(&data)?;
-        Ok(Tzf { data, header })
-    }
-
-    /// Parse the scan metadata block. TODO: confirm field offsets (see docs).
-    pub fn scan_meta(&self) -> Result<ScanMeta> {
-        Err(Error::Unimplemented("scan_meta: metadata-block field offsets unconfirmed"))
-    }
-
-    /// Walk the compressed-data region `[0x9c, sections[0])` and return every
-    /// patch stream: `[descriptor][0x78 0x01][raw DEFLATE → 1,048,576 B]`,
-    /// raw‑deflating from `offset+2`. Jumps by the consumed length after a hit.
-    pub fn patch_streams(&self) -> Vec<PatchStream> {
-        let end = (self.header.meta_offset() as usize).min(self.data.len()).saturating_sub(4);
-        let mut out = Vec::new();
-        let mut i = 0x9c;
-        while i < end {
-            if self.data[i] == 0x78 && self.data[i + 1] == 0x01 {
-                if let Ok((raw, consumed)) = inflate_raw_exact(&self.data[i + 2..], PATCH_BYTES) {
-                    out.push(PatchStream { offset: i, comp_size: consumed + 2, raw });
-                    i += 2 + consumed;
-                    continue;
-                }
+impl<'a> Iterator for Blocks<'a> {
+    type Item = Block;
+    fn next(&mut self) -> Option<Block> {
+        while self.pos + DESCRIPTOR_LEN <= self.end {
+            if let Some(b) = parse_block(self.d, self.pos, self.end) {
+                self.pos = b.payload_end;
+                return Some(b);
             }
-            i += 1;
+            // Resync: scan forward for the next structurally valid descriptor.
+            self.pos += 1;
         }
-        out
-    }
-
-    /// Decode a single patch at a `0x78 0x01` offset to its 1 MiB payload.
-    pub fn decode_patch(&self, offset: usize) -> Result<Vec<u8>> {
-        let (raw, _) = inflate_raw_exact(&self.data[offset + 2..], PATCH_BYTES)
-            .map_err(|_| Error::Decompress("patch did not inflate to 1 MiB".into()))?;
-        Ok(raw)
-    }
-
-    /// Decode all points. TODO: per‑patch pixel/plane layout + placement +
-    /// range scale + spherical→XYZ + tilt. See `docs/format.md`.
-    pub fn points(&self) -> Result<Vec<Point>> {
-        Err(Error::Unimplemented("points: pixel/plane layout + placement + geometry (WIP)"))
+        None
     }
 }
 
-/// Inflate a zlib stream (helper for the plain‑deflate case).
-pub fn zlib_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-    let mut out = Vec::new();
-    ZlibDecoder::new(bytes).read_to_end(&mut out).map_err(|e| Error::Decompress(e.to_string()))?;
-    Ok(out)
-}
-
-/// Raw‑DEFLATE `buf`, succeeding only if it yields exactly `expect` bytes.
-/// Returns (payload, compressed_bytes_consumed).
-fn inflate_raw_exact(buf: &[u8], expect: usize) -> std::result::Result<(Vec<u8>, usize), ()> {
-    use flate2::{Decompress, FlushDecompress};
-    let mut dec = Decompress::new(false); // raw deflate (no zlib header)
-    let mut out = vec![0u8; expect];
-    match dec.decompress(buf, &mut out, FlushDecompress::Finish) {
-        Ok(flate2::Status::StreamEnd) if dec.total_out() as usize == expect => {
-            Ok((out, dec.total_in() as usize))
-        }
-        _ => Err(()),
+/// Validate and parse the descriptor at `at`. Structural checks only (no magic
+/// constants): plausible component and tile indices, sane dimensions, raw size
+/// consistent with the dimensions, and a payload that fits in the data region.
+fn parse_block(d: &[u8], at: usize, end: usize) -> Option<Block> {
+    if at + DESCRIPTOR_LEN > end {
+        return None;
     }
+    let comp = rd_u32(d, at + 16) as usize;
+    let component = rd_u32(d, at + 20);
+    let (tile_row, tile_col) = (rd_u32(d, at + 24), rd_u32(d, at + 28));
+    let (w, h, raw) = (rd_u32(d, at + 36), rd_u32(d, at + 40), rd_u32(d, at + 44));
+    if !(1..=8).contains(&component) || tile_row >= 4096 || tile_col >= 4096 {
+        return None;
+    }
+    if !(1..=8192).contains(&w) || !(1..=8192).contains(&h) {
+        return None;
+    }
+    let px = w as u64 * h as u64;
+    if ![1u64, 2, 3, 4, 8].iter().any(|bpp| px * bpp == raw as u64) {
+        return None;
+    }
+    if comp < 28 {
+        return None;
+    }
+    let payload_start = at + DESCRIPTOR_LEN;
+    let payload_end = payload_start + (comp - 28);
+    if payload_end > end || payload_end <= payload_start + 2 {
+        return None;
+    }
+    let p = &d[payload_start..payload_end];
+    let kind = if p.len() >= 6 && p[4] == 0x78 && p[5] == 0x01 {
+        BlockKind::Deflate
+    } else if p.len() >= 3 && p[..3] == [0xff, 0xd8, 0xff] {
+        BlockKind::Jpeg
+    } else {
+        BlockKind::Unknown
+    };
+    Some(Block {
+        descriptor: at,
+        payload_start,
+        payload_end,
+        component,
+        tile_row,
+        tile_col,
+        width: w,
+        height: h,
+        raw_size: raw,
+        scale: f32::from_bits(rd_u32(d, at + 48)),
+        kind,
+    })
 }
 
-fn rd_u32(d: &[u8], o: usize) -> u32 { u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) }
-fn rd_u64(d: &[u8], o: usize) -> u64 { u64::from_le_bytes(d[o..o + 8].try_into().unwrap()) }
+fn rd_u32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
+}
+fn rd_u64(d: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+}
+fn rd_f64(d: &[u8], o: usize) -> f64 {
+    f64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn magic_len() { assert_eq!(MAGIC.len(), 8); }
+    use std::io::Write;
+
     #[test]
     fn rejects_non_tzf() {
-        assert!(matches!(Header::parse(&vec![0u8; 128]), Err(Error::BadMagic)));
+        assert!(matches!(Header::parse(&[0u8; 128]), Err(Error::BadMagic)));
     }
+
+    fn deflate_raw(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Append one block: 60-byte descriptor + payload.
+    fn push_block(buf: &mut Vec<u8>, component: u32, tile: (u32, u32), w: u32, h: u32, raw: u32, payload: &[u8]) {
+        let comp = (payload.len() + 28) as u32;
+        buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes()); // id
+        for v in [200u32, 16, comp, component, tile.0, tile.1, 100, w, h, raw] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&1.0f32.to_le_bytes()); // scale
+        buf.extend_from_slice(&0u64.to_le_bytes()); // hash
+        buf.extend_from_slice(payload);
+    }
+
+    fn synthetic() -> (Vec<u8>, Vec<u8>) {
+        let mut buf = vec![0u8; FIRST_DESCRIPTOR];
+        buf[..8].copy_from_slice(&MAGIC);
+        let raw_len = 64 * 64 * 4;
+        let zeros = vec![0u8; raw_len];
+        let pattern: Vec<u8> = (0..raw_len).map(|i| (i % 251) as u8).collect();
+        for (c, tile, data) in [(1u32, (0u32, 0u32), &zeros), (2, (1, 3), &pattern)] {
+            let mut p = (raw_len as u32).to_le_bytes().to_vec();
+            p.extend_from_slice(&[0x78, 0x01]);
+            p.extend_from_slice(&deflate_raw(data));
+            push_block(&mut buf, c, tile, 64, 64, raw_len as u32, &p);
+        }
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0xff, 0xd9];
+        push_block(&mut buf, 4, (1, 3), 64, 64, 64 * 64, &jpeg);
+        let data_end = buf.len() as u64;
+        buf[0x10..0x18].copy_from_slice(&data_end.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 0x40]); // metadata block
+        (buf, pattern)
+    }
+
     #[test]
-    fn parses_header_with_magic() {
-        let mut d = vec![0u8; 0x60];
-        d[..8].copy_from_slice(&MAGIC);
-        d[0x10..0x18].copy_from_slice(&1234u64.to_le_bytes());
-        let h = Header::parse(&d).unwrap();
-        assert_eq!(h.sections[0], 1234);
+    fn walks_and_decodes_blocks() {
+        let (buf, pattern) = synthetic();
+        let t = Tzf::from_bytes(buf).unwrap();
+        let bs: Vec<Block> = t.blocks().collect();
+        assert_eq!(bs.len(), 3);
+        assert_eq!(bs.iter().map(|b| b.component).collect::<Vec<_>>(), vec![1, 2, 4]);
+        assert_eq!(bs[0].kind, BlockKind::Deflate);
+        assert_eq!(bs[2].kind, BlockKind::Jpeg);
+        assert_eq!((bs[0].tile_row, bs[0].tile_col), (0, 0));
+        assert_eq!((bs[1].tile_row, bs[1].tile_col), (1, 3));
+        assert!(t.decode(&bs[0]).unwrap().iter().all(|&b| b == 0));
+        assert_eq!(t.decode(&bs[1]).unwrap(), pattern);
+        let j = t.payload(&bs[2]);
+        assert_eq!(&j[..2], &[0xff, 0xd8]);
+        assert_eq!(&j[j.len() - 2..], &[0xff, 0xd9]);
+        assert!(matches!(t.decode(&bs[2]), Err(Error::WrongKind { .. })));
+    }
+
+    #[test]
+    fn resyncs_past_garbage() {
+        let (mut buf, _) = synthetic();
+        // corrupt the first descriptor's width: walker should resync past it
+        buf[FIRST_DESCRIPTOR + 36..FIRST_DESCRIPTOR + 40].copy_from_slice(&0u32.to_le_bytes());
+        let t = Tzf::from_bytes(buf).unwrap();
+        let comps: Vec<u32> = t.blocks().map(|b| b.component).collect();
+        assert_eq!(comps, vec![2, 4]);
     }
 }

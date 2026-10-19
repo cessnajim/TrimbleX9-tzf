@@ -15,4 +15,5 @@ path = "src/bin/tzfdump.rs"
 
 [dependencies]
 flate2 = "1"
+memmap2 = "0.9"
 thiserror = "2"
