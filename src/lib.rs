@@ -1,4 +1,4 @@
-//! `tzf` — a reader for **Trimble X‑series `.tzf`** terrestrial‑laser‑scan files.
+//! `trimble_tzf` — a reader for **Trimble `.tzf`** laser‑scan point‑cloud files.
 //!
 //! The format here is documented purely from the **observable byte structure**
 //! of `.tzf` files (see `docs/format.md`); this project contains no vendor code

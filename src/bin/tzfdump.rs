@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
-use tzf::{BlockKind, Tzf};
+use trimble_tzf::{BlockKind, Tzf};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
     println!("file      : {path}");
     println!("size      : {} bytes", tzf.bytes().len());
     println!("sections  :");
-    for (pos, off) in tzf::SECTION_POS.iter().zip(&h.sections) {
+    for (pos, off) in trimble_tzf::SECTION_POS.iter().zip(&h.sections) {
         println!("  @0x{pos:02x} -> {off} (0x{off:x})");
     }
     match tzf.scan_meta() {

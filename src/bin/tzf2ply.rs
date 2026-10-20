@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let tzf = tzf::Tzf::open(std::path::Path::new(&args[1]))?;
+    let tzf = trimble_tzf::Tzf::open(std::path::Path::new(&args[1]))?;
     let meta = tzf.scan_meta()?;
     let pts = tzf.grid_points()?;
     let gray = match args.iter().position(|a| a == "--intensity-pgm") {
@@ -45,7 +45,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let g = |p: &tzf::GridPoint| match &gray {
+    let g = |p: &trimble_tzf::GridPoint| match &gray {
         Some((w, px)) => px[p.row as usize * w + p.col as usize],
         None => 128u8,
     };
@@ -63,8 +63,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn write_ply(
     path: &str,
-    pts: &[tzf::GridPoint],
-    gray: &dyn Fn(&tzf::GridPoint) -> u8,
+    pts: &[trimble_tzf::GridPoint],
+    gray: &dyn Fn(&trimble_tzf::GridPoint) -> u8,
 ) -> std::io::Result<()> {
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     write!(
@@ -88,8 +88,8 @@ fn write_ply(
 /// LAS 1.2, point data format 0 (20-byte records), no VLRs.
 fn write_las(
     path: &str,
-    pts: &[tzf::GridPoint],
-    gray: &dyn Fn(&tzf::GridPoint) -> u8,
+    pts: &[trimble_tzf::GridPoint],
+    gray: &dyn Fn(&trimble_tzf::GridPoint) -> u8,
 ) -> std::io::Result<()> {
     const SCALE: f64 = 0.0001;
     let mut min = [f64::MAX; 3];

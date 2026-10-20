@@ -1,6 +1,6 @@
-# TrimbleX9-tzf
+# trimble-tzf
 
-A Rust reader for **Trimble X‑series `.tzf`** terrestrial‑laser‑scan files (X7/X9).
+A Rust reader for **Trimble `.tzf`** laser‑scan point‑cloud files, validated on the X9.
 The format is documented from the **observable byte structure** of `.tzf` files
 in `docs/format.md`. A scan's data region is a sequence of blocks, each a
 60‑byte descriptor plus a payload, tiling a 512×512 grid with several
@@ -42,7 +42,7 @@ cargo test
 ```
 
 ```rust
-use tzf::{BlockKind, Tzf};
+use trimble_tzf::{BlockKind, Tzf};
 
 let tzf = Tzf::open(std::path::Path::new("scan.tzf"))?;
 let meta = tzf.scan_meta()?;

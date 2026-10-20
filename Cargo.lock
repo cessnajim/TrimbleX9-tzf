@@ -115,7 +115,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tzf"
+name = "trimble-tzf"
 version = "0.1.0"
 dependencies = [
  "flate2",

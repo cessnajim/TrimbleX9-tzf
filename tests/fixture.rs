@@ -4,7 +4,7 @@
 #[test]
 fn decodes_fixture_when_present() {
     let Ok(path) = std::env::var("TZF_FIXTURE") else { return };
-    let tzf = tzf::Tzf::open(std::path::Path::new(&path)).unwrap();
+    let tzf = trimble_tzf::Tzf::open(std::path::Path::new(&path)).unwrap();
     let meta = tzf.scan_meta().unwrap();
     let pts = tzf.points().unwrap();
     assert_eq!(pts.len() as u64, meta.n_points as u64);
