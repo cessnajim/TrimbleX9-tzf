@@ -33,12 +33,15 @@ jobs:
       - env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: tar -C target/${{ matrix.target }}/release -czf tzfdump-${{ matrix.target }}.tar.gz tzfdump
+      - run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/tzfdump target/${{ matrix.target }}/release/tzf2ply LICENSE README.md dist/
+          tar -C dist -czf trimble-tzf-${{ matrix.target }}.tar.gz tzfdump tzf2ply LICENSE README.md
       - uses: actions/upload-artifact@v4
         with:
-          name: tzfdump-${{ matrix.target }}
-          path: tzfdump-${{ matrix.target }}.tar.gz
+          name: trimble-tzf-${{ matrix.target }}
+          path: trimble-tzf-${{ matrix.target }}.tar.gz
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: tzfdump-${{ matrix.target }}.tar.gz
+          files: trimble-tzf-${{ matrix.target }}.tar.gz

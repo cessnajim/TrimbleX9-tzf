@@ -3,13 +3,18 @@
 //! Usage: `tzf2ply <in.tzf> <out-base> [--intensity-pgm <grid.pgm>]`
 //!
 //! Writes `<out-base>.ply` (x y z float + gray rgb) and `<out-base>.las`
-//! (point format 0, 0.1 mm scale). TZF files carry no intensity plane we know
-//! of yet, so intensity can come from a grayscale image with one pixel per
-//! grid cell (`cols` wide × `rows` tall), e.g. the scanner's preview JPEG
-//! converted to binary PGM. Without it, points are written mid-gray.
+//! (point format 0, 0.1 mm scale). Some scans carry a per-tile JPEG intensity
+//! image (component 4, see `docs/format.md`), but it is not decoded yet, so
+//! intensity can come from a grayscale image with one pixel per grid cell
+//! (`cols` wide × `rows` tall), e.g. the scanner's preview JPEG converted to
+//! binary PGM. Without it, points are written mid-gray.
+//!
+//! If the file's levelling rotation is missing or not a proper rotation, the
+//! points are written unlevelled and a warning is printed to stderr.
 
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
+use trimble_tzf::Levelling;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -29,6 +34,15 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let tzf = trimble_tzf::Tzf::open(std::path::Path::new(&args[1]))?;
     let meta = tzf.scan_meta()?;
+    match meta.levelling {
+        Levelling::Applied => {}
+        Levelling::Missing => {
+            eprintln!("warning: no levelling rotation in the file; points are NOT levelled")
+        }
+        Levelling::NotARotation => eprintln!(
+            "warning: stored levelling matrix is not a proper rotation; points are NOT levelled"
+        ),
+    }
     let pts = tzf.grid_points()?;
     let gray = match args.iter().position(|a| a == "--intensity-pgm") {
         Some(i) => {

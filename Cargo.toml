@@ -1,6 +1,6 @@
 [package]
 name = "trimble-tzf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Reader for Trimble .tzf laser-scan point-cloud files, documented from observed file structure."

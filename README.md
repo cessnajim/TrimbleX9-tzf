@@ -62,26 +62,28 @@ cargo build --release          # target/release/tzfdump, target/release/tzf2ply
 cargo test
 ```
 
-Install the binaries into `~/.cargo/bin`:
+Install both binaries into `~/.cargo/bin`:
 
 ```bash
-cargo install --git https://github.com/cessnajim/trimble-tzf
+cargo install --git https://github.com/cessnajim/trimble-tzf --tag v0.2.0
 ```
 
 Use the library from another crate:
 
 ```toml
 [dependencies]
-trimble-tzf = { git = "https://github.com/cessnajim/trimble-tzf" }
+trimble-tzf = { git = "https://github.com/cessnajim/trimble-tzf", tag = "v0.2.0" }
 ```
 
-The crate is imported as `trimble_tzf`. The `v0.1.0` tag predates point
-decoding, Snappy support and `tzf2ply` (and the package was still named
-`tzf` then), so build from `main` until a newer tag exists.
+The crate is imported as `trimble_tzf`. Use `v0.2.0` or later: the `v0.1.0`
+tag predates point decoding, Snappy support and `tzf2ply` (and the package
+was still named `tzf` then). Changes are listed in
+[`CHANGELOG.md`](CHANGELOG.md).
 
-Tagged releases attach prebuilt `tzfdump` binaries for
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (64-bit Raspberry
-Pi OS). `tzf2ply` is not attached; build it from source.
+Tagged releases attach prebuilt binaries for `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` (64-bit Raspberry Pi OS) as
+`trimble-tzf-<target>.tar.gz`, each holding `tzfdump`, `tzf2ply`, `LICENSE`
+and `README.md`.
 
 ## tzfdump
 
@@ -142,7 +144,9 @@ tzf2ply <in.tzf> <out-base> [--intensity-pgm <grid.pgm>]
 The input and output base must be the first two arguments, in that order.
 It writes **two** files, `<out-base>.ply` and `<out-base>.las`, overwriting
 them if they exist, and prints `<n> points (<declared> expected) -> …` to
-stderr.
+stderr. If the file's levelling rotation is missing or is not a proper
+rotation, it also prints a `warning: … points are NOT levelled` line to
+stderr and writes the points unlevelled (exit status is still `0`).
 
 | Argument / flag | Effect |
 |---|---|
@@ -158,8 +162,8 @@ with the scanner at the origin (see [Coordinates](#coordinates)).
 | `.ply` | `binary_little_endian 1.0`, one `vertex` element per point: `float x, y, z` and `uchar red, green, blue` (all three set to the gray value). 15 bytes per point. |
 | `.las` | LAS 1.2, point data format 0, 20-byte records, 227-byte header, no VLRs. Scale 0.0001 (0.1 mm) on all axes; offsets are the minimum corner; bounds are set. Intensity = gray × 257 (0–65535). Every point is return 1 of 1, class 0, point source 0. No coordinate reference system, GPS time, file creation date or project GUID. |
 
-**Intensity from the scanner's preview.** The intensity planes in the file are
-not decoded yet. The scanner's panoramic preview image (served by the
+**Intensity from the scanner's preview.** The per-tile intensity JPEGs
+(component 4) are located but not decoded yet. The scanner's panoramic preview image (served by the
 scanner's HTTP API next to each scan file, e.g. via
 [TrimbleX9-mcp](https://github.com/cessnajim/TrimbleX9-mcp)'s
 `scanner_download_preview`) is aligned with the
@@ -187,6 +191,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Grid size, angle steps, start angles, point count, levelling.
     let meta = tzf.scan_meta()?;
     println!("{} x {} cells, {} points", meta.grid_rows, meta.grid_cols, meta.n_points);
+    if !meta.levelling.is_applied() {
+        eprintln!("not levelled: {:?}", meta.levelling);
+    }
 
     // Levelled XYZ in metres, scanner at the origin, +z up.
     for p in tzf.points()?.iter().take(5) {
@@ -231,23 +238,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `points(&self) -> Result<Vec<Point>>` | All valid points, levelled, in metres. `intensity` is always `0.0` for now. |
 | `grid_points(&self) -> Result<Vec<GridPoint>>` | Like `points`, with each point's grid `row` and `col`. Sorted by column, then row. |
 
-`points` and `grid_points` need components 1, 2 and 3 for every tile that has
-any of them; a tile missing one is an error. Component 4 and unknown
-components are ignored.
+`points` and `grid_points` need exactly one block each of components 1, 2 and
+3 for every tile that has any of them, all with the same width and height, 4
+bytes per cell, and no larger than the metadata tile size. Anything else
+(a missing or duplicated component, a plane of the wrong size) is an
+`Error::Malformed`, not a panic. Component 4 and unknown components are
+ignored.
 
 ### Data types
 
 | Type | Fields / methods |
 |---|---|
 | `Header` | `magic: [u8; 8]`; `word_08`, `word_0c: u32` (roles unknown); `sections: Vec<u64>` (the seven section offsets); `parse(&[u8]) -> Result<Header>`; `meta_offset() -> u64` (= `sections[0]`, the metadata block and end of the block data). |
-| `ScanMeta` | `grid_rows`, `grid_cols`, `tile_size`, `n_points: u32`; `angle_step_rad: [f64; 2]` (horizontal, vertical); `start_ha_rad: f64` (HA of column 0, in [0, 2π), un-negated); `start_va_rad: f64` (VA of row 0, from the zenith); `tilt: [[f64; 3]; 3]` (levelling rotation, row-major); `ha_of_col(f64) -> f64`; `va_of_row(f64) -> f64`. |
+| `ScanMeta` | `grid_rows`, `grid_cols`, `tile_size`, `n_points: u32`; `angle_step_rad: [f64; 2]` (horizontal, vertical); `start_ha_rad: f64` (HA of column 0, in [0, 2π), un-negated); `start_va_rad: f64` (VA of row 0, from the zenith); `tilt: [[f64; 3]; 3]` (levelling rotation, row-major); `levelling: Levelling` (whether `tilt` is the stored rotation); `ha_of_col(f64) -> f64` (instrument HA of a column); `azimuth_of_col(f64) -> f64` (`atan2(y, x)` of that column's points, = 2π − HA); `va_of_row(f64) -> f64`. |
+| `Levelling` | `Applied` (stored rotation used), `Missing` (metadata too short; identity used), `NotARotation` (stored matrix rejected; identity used); `is_applied() -> bool`. |
 | `Block` | `descriptor` (offset); `payload_start`, `payload_end` (byte range); `component` (1–4 on known files); `tile_row`, `tile_col`; `width`, `height` (512 × 512 on known files); `raw_size` (declared decoded bytes); `scale: f32` (descriptor value; the range divisor for component 1); `kind: BlockKind`. `Copy`, holds no payload. |
 | `BlockKind` | `Deflate`, `Snappy`, `Jpeg`, `Unknown`, detected from the payload's first bytes. |
 | `Blocks<'a>` | The iterator returned by `blocks()`, yielding `Block`. |
 | `Point` | `x`, `y`, `z`, `intensity: f32`. |
 | `GridPoint` | `point: Point`; `row`, `col: u32`. |
-| `Error` | `BadMagic`; `Truncated { need, have }`; `Io(std::io::Error)`; `Decompress(String)` (also used for missing components and files with no range/angle blocks); `WrongKind { offset, kind }` (decoding a block that is not DEFLATE or Snappy); `Unimplemented(&str)` (reserved, not currently returned). |
+| `Error` | `BadMagic`; `Truncated { need, have }`; `Io(std::io::Error)`; `Decompress(String)` (a payload that does not decode to its declared size, or declares more than it could expand to); `WrongKind { offset, kind }` (decoding a block that is not DEFLATE or Snappy); `Malformed(String)` (blocks that do not fit together: missing or duplicated components, planes of the wrong or differing sizes, no range/angle blocks). |
 | `Result<T>` | `std::result::Result<T, Error>`. |
+
+Functions: `ha_to_azimuth(f64) -> f64` converts an instrument HA to the
+x/y azimuth of decoded points and back (`(2π − a) mod 2π`).
 
 Constants: `MAGIC` (the 8-byte file magic), `SECTION_POS` (header positions of
 the section offsets), `FIRST_DESCRIPTOR` (`0x5c`), `DESCRIPTOR_LEN` (`60`),
@@ -278,15 +292,22 @@ then levelled with p′ = Rᵀ · p, so +z points up. `va` and `ha` are the
 per-point angles from components 2 and 3, used as stored. Because the file
 stores the horizontal angle negated, a point's azimuth `atan2(y, x)` is
 2π − HA, where HA is the instrument's horizontal angle as in
-`ScanMeta::ha_of_col` and in area-scan commands.
+`ScanMeta::ha_of_col` and in area-scan commands. So x/y azimuth increases
+the opposite way to HA. `ScanMeta::azimuth_of_col` gives the azimuth of a
+column directly and `ha_to_azimuth` converts either way; the unit test
+`point_azimuth_is_two_pi_minus_ha` pins the relation down. It is exact before
+levelling; levelling tilts points by the small tilt angle, so levelled
+points match to within that. The output coordinates are unchanged from
+earlier versions.
 
 The horizontal zero is the instrument's own; points are not georeferenced and
 scans from different stations are not registered to each other.
 
 If the stored levelling matrix is missing or is not a proper rotation
 (orthonormal with determinant +1, to 1e-6), `scan_meta()` uses the identity
-and points are **not levelled**. Nothing reports this; compare `meta.tilt`
-with the identity if it matters.
+and points are **not levelled**. `ScanMeta::levelling` says which case
+applies, and `tzf2ply` prints a warning. All scans tested so far are
+levelled.
 
 ## Accuracy
 
@@ -320,9 +341,12 @@ a reference) has not been measured.
 - **Validated on the X9 only**, on scans recorded in October 2026. Other
   models or firmware may use payload kinds or layouts not seen yet; `tzfdump
   --verify` reports blocks it cannot decode.
-- **Trusts the file.** The decoder is written for files from the scanner, not
-  hostile input: a malformed file can make it allocate based on the declared
-  point count, or panic if a range or angle block is not 4 bytes per cell.
+- **Not hardened against hostile input.** Malformed range/angle planes,
+  duplicate blocks and impossible declared sizes are reported as errors, and
+  allocations are sized from the data present rather than the declared point
+  count; unit tests truncate and corrupt every byte of a small synthetic file
+  without a panic. The decoder has not been fuzzed, and a corrupt but
+  structurally valid file can still decode to wrong points.
 - **Whole cloud in memory** for `points()`, `grid_points()` and `tzf2ply`
   (see [Memory](#memory)).
 - **LAS point counts** use the 32-bit legacy fields of LAS 1.2, so `tzf2ply`
@@ -336,8 +360,8 @@ cargo test
 
 | Test | What it checks |
 |---|---|
-| Unit tests in `src/lib.rs` (synthetic files) | Non-`.tzf` input is rejected; block walk, tile placement and DEFLATE decode; JPEG blocks are not decodable; metadata angles and HA wrap-around; Snappy literals and overlapping copies; the levelling guard accepts only proper rotations; range/angle planes turn into the expected XYZ; the walker resyncs past a corrupt descriptor |
-| `tests/fixture.rs` | With `TZF_FIXTURE=<path to a .tzf>`: decodes the file, checks the point count equals the declared count and every range is between 0.1 m and 400 m. Without the variable it passes without doing anything. |
+| Unit tests in `src/lib.rs` (synthetic files) | Non-`.tzf` input is rejected; block walk, tile placement and DEFLATE decode; JPEG blocks are not decodable; metadata angles and HA wrap-around; Snappy literals and overlapping copies; the levelling guard accepts only proper rotations and `ScanMeta::levelling` reports each case; range/angle planes turn into the expected XYZ; point azimuth is 2π − HA; the walker resyncs past a corrupt descriptor; planes not 4 bytes per cell, planes of differing sizes, duplicate or missing components and blocks larger than a tile are errors; a huge declared point count or raw size does not drive allocation; every truncation and single-byte corruption of a synthetic file returns without panicking |
+| `tests/fixture.rs` | With `TZF_FIXTURE=<path to a .tzf>`: decodes the file, checks levelling was applied, the point count equals the declared count and every range is between 0.1 m and 400 m. Without the variable it passes without doing anything. |
 
 Scan files are not committed (size, and they show private places), so the
 fixture test is opt-in:
@@ -346,8 +370,8 @@ fixture test is opt-in:
 TZF_FIXTURE=/path/to/scan.tzf cargo test --release
 ```
 
-CI runs `cargo test --locked` and builds release binaries for x86_64 and
-aarch64 Linux.
+CI runs `cargo test --locked` and builds release archives (`tzfdump` and
+`tzf2ply`) for x86_64 and aarch64 Linux.
 
 ## License
 

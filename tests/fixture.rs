@@ -6,6 +6,7 @@ fn decodes_fixture_when_present() {
     let Ok(path) = std::env::var("TZF_FIXTURE") else { return };
     let tzf = trimble_tzf::Tzf::open(std::path::Path::new(&path)).unwrap();
     let meta = tzf.scan_meta().unwrap();
+    assert!(meta.levelling.is_applied(), "levelling: {:?}", meta.levelling);
     let pts = tzf.points().unwrap();
     assert_eq!(pts.len() as u64, meta.n_points as u64);
     for p in &pts {

@@ -7,7 +7,8 @@
 //! A scan's data region is a sequence of **blocks**. Each block is a 60‑byte
 //! descriptor followed by its payload; blocks tile the scan grid in 512×512
 //! tiles, with several **components** per tile (on sample files: components
-//! 1–3 are raw‑DEFLATE 512×512×4 payloads, component 4 is a 512×512 JPEG).
+//! 1–3 are 512×512×4 raw‑DEFLATE or raw‑Snappy payloads, component 4 is a
+//! 512×512 JPEG).
 //!
 //! The file is memory‑mapped and [`Tzf::blocks`] is a lazy, allocation‑free
 //! iterator; payloads are only decompressed when you ask for one.
@@ -45,10 +46,13 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("decompress: {0}")]
     Decompress(String),
-    #[error("block at 0x{offset:x} is {kind:?}, not decodable as deflate")]
+    /// [`Tzf::decode`] was asked for a block that is not DEFLATE or Snappy.
+    #[error("block at 0x{offset:x} is {kind:?}, not a DEFLATE or Snappy block")]
     WrongKind { offset: usize, kind: BlockKind },
-    #[error("not implemented yet: {0}")]
-    Unimplemented(&'static str),
+    /// The blocks are individually readable but do not fit together: a missing
+    /// or duplicated component, or planes whose sizes disagree.
+    #[error("malformed scan: {0}")]
+    Malformed(String),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -108,8 +112,30 @@ pub struct ScanMeta {
     pub start_va_rad: f64,
     /// Levelling rotation stored at metadata offset 0x44 (row-major 3×3 f64).
     /// Points are levelled with `p' = tiltᵀ · p`. Identity when the stored
-    /// matrix is absent or not a proper rotation.
+    /// matrix is absent or not a proper rotation; [`ScanMeta::levelling`]
+    /// says which.
     pub tilt: [[f64; 3]; 3],
+    /// Whether `tilt` is the stored rotation or an identity stand-in.
+    pub levelling: Levelling,
+}
+
+/// Where [`ScanMeta::tilt`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Levelling {
+    /// The stored rotation is used: points are levelled.
+    Applied,
+    /// The metadata block ends before the rotation: identity used, points are
+    /// **not** levelled.
+    Missing,
+    /// The stored matrix is not a proper rotation (orthonormal, det +1, to
+    /// 1e-6): identity used, points are **not** levelled.
+    NotARotation,
+}
+
+impl Levelling {
+    pub fn is_applied(self) -> bool {
+        self == Levelling::Applied
+    }
 }
 
 const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -132,15 +158,33 @@ fn as_rotation(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
 }
 
 impl ScanMeta {
-    /// Horizontal angle (radians, `[0, 2π)`) of grid column `col`.
+    /// Instrument horizontal angle (radians, `[0, 2π)`) of grid column `col`,
+    /// as used by area-scan commands. This is **not** the azimuth of the
+    /// decoded points: see [`ScanMeta::azimuth_of_col`].
     pub fn ha_of_col(&self, col: f64) -> f64 {
         (self.start_ha_rad + col * self.angle_step_rad[0]).rem_euclid(std::f64::consts::TAU)
+    }
+
+    /// Azimuth `atan2(y, x)` (radians, `[0, 2π)`) that decoded points of grid
+    /// column `col` have, before levelling: `2π − ha_of_col(col)`. The file
+    /// stores the horizontal angle negated and [`Tzf::points`] uses it as
+    /// stored, so x/y azimuth runs the opposite way to the instrument's HA.
+    /// Levelling tilts points by up to the tilt angle (a few hundredths of a
+    /// radian on samples), so levelled points match only approximately.
+    pub fn azimuth_of_col(&self, col: f64) -> f64 {
+        ha_to_azimuth(self.ha_of_col(col))
     }
 
     /// Vertical angle (radians from the zenith) of grid row `row`.
     pub fn va_of_row(&self, row: f64) -> f64 {
         self.start_va_rad + row * self.angle_step_rad[1]
     }
+}
+
+/// Convert an instrument horizontal angle to the x/y azimuth of decoded points
+/// (and back: the map is its own inverse): `(2π − a) mod 2π`.
+pub fn ha_to_azimuth(a: f64) -> f64 {
+    (-a).rem_euclid(std::f64::consts::TAU)
 }
 
 /// Component number of the range plane (see [`Tzf::points`]).
@@ -234,13 +278,26 @@ impl Tzf {
     /// Parse the scan metadata block.
     pub fn scan_meta(&self) -> Result<ScanMeta> {
         let d = self.bytes();
-        let m = self.header.meta_offset() as usize;
-        if m + 0x40 > d.len() {
+        let m = usize::try_from(self.header.meta_offset()).unwrap_or(usize::MAX);
+        let need = m.saturating_add(0x40);
+        if need > d.len() {
             return Err(Error::Truncated {
-                need: m + 0x40,
+                need,
                 have: d.len(),
             });
         }
+        let (tilt, levelling) = if m + 0x44 + 72 <= d.len() {
+            let mut t = [[0.0; 3]; 3];
+            for (k, v) in t.iter_mut().flatten().enumerate() {
+                *v = rd_f64(d, m + 0x44 + 8 * k);
+            }
+            match as_rotation(t) {
+                Some(r) => (r, Levelling::Applied),
+                None => (IDENTITY, Levelling::NotARotation),
+            }
+        } else {
+            (IDENTITY, Levelling::Missing)
+        };
         Ok(ScanMeta {
             angle_step_rad: [rd_f64(d, m + 0x10), rd_f64(d, m + 0x18)],
             start_va_rad: rd_f64(d, m + 0x20),
@@ -249,15 +306,8 @@ impl Tzf {
             grid_cols: rd_u32(d, m + 0x34),
             tile_size: rd_u32(d, m + 0x38),
             n_points: rd_u32(d, m + 0x3c),
-            tilt: if m + 0x44 + 72 <= d.len() {
-                let mut t = [[0.0; 3]; 3];
-                for (k, v) in t.iter_mut().flatten().enumerate() {
-                    *v = rd_f64(d, m + 0x44 + 8 * k);
-                }
-                as_rotation(t).unwrap_or(IDENTITY)
-            } else {
-                IDENTITY
-            },
+            tilt,
+            levelling,
         })
     }
 
@@ -283,7 +333,23 @@ impl Tzf {
 
     /// Decode a `Deflate` or `Snappy` block into `out` (reused across calls to
     /// avoid reallocating). On success `out.len() == b.raw_size`.
+    ///
+    /// The output buffer is sized from the declared raw size only after
+    /// checking the payload could expand that far, so a corrupt descriptor
+    /// cannot force a large allocation from a small payload.
     pub fn decode_into(&self, b: &Block, out: &mut Vec<u8>) -> Result<()> {
+        let max_ratio = match b.kind {
+            BlockKind::Deflate => DEFLATE_MAX_RATIO,
+            BlockKind::Snappy => SNAPPY_MAX_RATIO,
+            _ => 0,
+        };
+        let payload_len = b.payload_end - b.payload_start;
+        if max_ratio > 0 && b.raw_size as usize > payload_len.saturating_mul(max_ratio) {
+            return Err(Error::Decompress(format!(
+                "block at 0x{:x}: {} payload bytes cannot expand to the declared {}",
+                b.descriptor, payload_len, b.raw_size
+            )));
+        }
         if b.kind == BlockKind::Snappy {
             return snappy_decompress_into(self.payload(b), b.raw_size as usize, out).map_err(|_| {
                 Error::Decompress(format!("snappy block at 0x{:x} did not decode", b.descriptor))
@@ -336,6 +402,13 @@ impl Tzf {
     /// `line × height + k` is grid column `tile_col × tile + line`, row
     /// `tile_row × tile + k`. Angle planes hold µrad: the first cell of each
     /// line is absolute, the rest are `i32` deltas. Range = value / scale / 1000 m.
+    ///
+    /// Structural problems are errors, never panics: a tile missing one of
+    /// the three components or holding two blocks for one, planes that are not
+    /// 4 bytes per cell, planes of one tile that differ in size, or a block
+    /// larger than the metadata tile size all return [`Error::Malformed`].
+    /// The output is sized from the cells actually present, not the declared
+    /// point count.
     pub fn grid_points(&self) -> Result<Vec<GridPoint>> {
         use std::collections::BTreeMap;
         let meta = self.scan_meta()?;
@@ -348,21 +421,59 @@ impl Tzf {
                 COMPONENT_HORIZONTAL_ANGLE => 2,
                 _ => continue,
             };
-            tiles.entry((b.tile_row, b.tile_col)).or_default()[slot] = Some(b);
+            let entry = &mut tiles.entry((b.tile_row, b.tile_col)).or_default()[slot];
+            if let Some(prev) = entry {
+                return Err(Error::Malformed(format!(
+                    "tile ({},{}) has two component {} blocks (0x{:x} and 0x{:x})",
+                    b.tile_row, b.tile_col, b.component, prev.descriptor, b.descriptor
+                )));
+            }
+            *entry = Some(b);
         }
         if tiles.is_empty() {
-            return Err(Error::Decompress("no range/angle blocks found".into()));
+            return Err(Error::Malformed("no range/angle blocks found".into()));
         }
-        let t = meta.tilt;
-        let mut out = Vec::with_capacity(meta.n_points as usize);
-        let (mut rb, mut vb, mut hb) = (Vec::new(), Vec::new(), Vec::new());
+        let mut cells = 0u64;
+        let mut checked = Vec::with_capacity(tiles.len());
         for (&(tr, tc), p) in &tiles {
-            let [Some(r), Some(v), Some(h)] = p else {
-                return Err(Error::Decompress(format!("tile ({tr},{tc}) is missing a component")));
+            let [Some(r), Some(v), Some(h)] = *p else {
+                return Err(Error::Malformed(format!("tile ({tr},{tc}) is missing a component")));
             };
-            self.decode_into(r, &mut rb)?;
-            self.decode_into(v, &mut vb)?;
-            self.decode_into(h, &mut hb)?;
+            for b in [&r, &v, &h] {
+                let n = b.width as u64 * b.height as u64;
+                if b.raw_size as u64 != n * 4 {
+                    return Err(Error::Malformed(format!(
+                        "block at 0x{:x}: {}x{} cells but {} bytes, not 4 per cell",
+                        b.descriptor, b.width, b.height, b.raw_size
+                    )));
+                }
+                if (b.width, b.height) != (r.width, r.height) {
+                    return Err(Error::Malformed(format!(
+                        "tile ({tr},{tc}): component {} is {}x{}, range is {}x{}",
+                        b.component, b.width, b.height, r.width, r.height
+                    )));
+                }
+                if b.width as usize > tile || b.height as usize > tile {
+                    return Err(Error::Malformed(format!(
+                        "block at 0x{:x} is {}x{}, larger than the {tile}-cell tile",
+                        b.descriptor, b.width, b.height
+                    )));
+                }
+            }
+            cells += r.width as u64 * r.height as u64;
+            checked.push(((tr, tc), [r, v, h]));
+        }
+        let cap = cells
+            .min(meta.n_points as u64)
+            .min(meta.grid_rows as u64 * meta.grid_cols as u64);
+        let t = meta.tilt;
+        let mut out = Vec::with_capacity(cap as usize);
+        let (mut rb, mut vb, mut hb) = (Vec::new(), Vec::new(), Vec::new());
+        for ((tr, tc), [r, v, h]) in checked {
+            self.decode_into(&r, &mut rb)?;
+            self.decode_into(&v, &mut vb)?;
+            self.decode_into(&h, &mut hb)?;
+            // decode_into yields exactly raw_size = width × height × 4 bytes.
             let (lines, per_line) = (r.width as usize, r.height as usize);
             let cell = |buf: &[u8], i: usize| rd_u32(buf, i * 4);
             for line in 0..lines {
@@ -583,6 +694,12 @@ fn snappy_decompress_into(buf: &[u8], expect: usize, out: &mut Vec<u8>) -> std::
     Ok(())
 }
 
+/// Upper bounds on how far a payload can expand, used to reject impossible
+/// declared sizes before allocating. Raw DEFLATE tops out near 1032:1; a
+/// Snappy copy element of 3 bytes yields at most 64.
+const DEFLATE_MAX_RATIO: usize = 1100;
+const SNAPPY_MAX_RATIO: usize = 22;
+
 fn rd_u32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
 }
@@ -711,34 +828,53 @@ mod tests {
         assert!(as_rotation([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]).is_none());
     }
 
-    /// One 2x2 tile: two vertical lines at HA 0 and 90°, both rows at VA 90°
-    /// (horizontal), range 1 m and 2 m. Expect points on +x and +y.
-    #[test]
-    fn decodes_points_from_planes() {
+    /// One plane block for [`plane_file`]: component, tile, width, height,
+    /// descriptor scale, decoded bytes.
+    type Plane = (u32, (u32, u32), u32, u32, f32, Vec<u8>);
+
+    fn cells(v: &[u32]) -> Vec<u8> {
+        v.iter().flat_map(|c| c.to_le_bytes()).collect()
+    }
+
+    /// Build a file from DEFLATE plane blocks plus a metadata block with the
+    /// given grid (rows, cols, tile size, point count) and an all-zero tilt.
+    /// Returns the file and the metadata offset.
+    fn plane_file(planes: &[Plane], grid: (u32, u32, u32, u32)) -> (Vec<u8>, usize) {
         let mut buf = vec![0u8; FIRST_DESCRIPTOR];
         buf[..8].copy_from_slice(&MAGIC);
-        let q = 1_570_796u32; // π/2 in µrad
-        let planes: [(u32, f32, [u32; 4]); 3] = [
-            (COMPONENT_RANGE, 10.0, [10_000, 20_000, 10_000, 20_000]),
-            (COMPONENT_VERTICAL_ANGLE, 1.0, [q, 0, q, 0]),
-            (COMPONENT_HORIZONTAL_ANGLE, 1.0, [0, 0, q, 0]),
-        ];
-        for (comp, scale, cells) in planes {
-            let raw: Vec<u8> = cells.iter().flat_map(|c| c.to_le_bytes()).collect();
+        for (comp, tile, w, h, scale, raw) in planes {
             let mut p = (raw.len() as u32).to_le_bytes().to_vec();
             p.extend_from_slice(&[0x78, 0x01]);
-            p.extend_from_slice(&deflate_raw(&raw));
-            push_block(&mut buf, comp, (0, 0), 2, 2, raw.len() as u32, &p);
+            p.extend_from_slice(&deflate_raw(raw));
+            push_block(&mut buf, *comp, *tile, *w, *h, raw.len() as u32, &p);
             let at = buf.len() - p.len() - DESCRIPTOR_LEN;
             buf[at + 48..at + 52].copy_from_slice(&scale.to_le_bytes());
         }
         let m = buf.len();
         buf[0x10..0x18].copy_from_slice(&(m as u64).to_le_bytes());
-        buf.extend_from_slice(&[0u8; 0x40 + 72]);
-        buf[m + 0x30..m + 0x34].copy_from_slice(&2u32.to_le_bytes());
-        buf[m + 0x34..m + 0x38].copy_from_slice(&2u32.to_le_bytes());
-        buf[m + 0x38..m + 0x3c].copy_from_slice(&2u32.to_le_bytes());
-        buf[m + 0x3c..m + 0x40].copy_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 0x44 + 72]);
+        let (rows, cols, tile, n) = grid;
+        for (off, v) in [(0x30, rows), (0x34, cols), (0x38, tile), (0x3c, n)] {
+            buf[m + off..m + off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        (buf, m)
+    }
+
+    /// One 2x2 tile: two vertical lines at HA 0 and 90°, both rows at VA 90°
+    /// (horizontal), range 1 m and 2 m.
+    fn two_line_planes() -> Vec<Plane> {
+        let q = 1_570_796u32; // π/2 in µrad
+        vec![
+            (COMPONENT_RANGE, (0, 0), 2, 2, 10.0, cells(&[10_000, 20_000, 10_000, 20_000])),
+            (COMPONENT_VERTICAL_ANGLE, (0, 0), 2, 2, 1.0, cells(&[q, 0, q, 0])),
+            (COMPONENT_HORIZONTAL_ANGLE, (0, 0), 2, 2, 1.0, cells(&[0, 0, q, 0])),
+        ]
+    }
+
+    /// Expect the two-line tile's points on +x and +y.
+    #[test]
+    fn decodes_points_from_planes() {
+        let (buf, _) = plane_file(&two_line_planes(), (2, 2, 2, 4));
         let pts = Tzf::from_bytes(buf).unwrap().grid_points().unwrap();
         assert_eq!(pts.len(), 4);
         let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
@@ -746,6 +882,160 @@ mod tests {
         assert!(near(p00.x, 1.0) && near(p00.y, 0.0) && near(p00.z, 0.0));
         let p11 = pts[3].point; // col 1, row 1: 2 m along +y
         assert!(near(p11.x, 0.0) && near(p11.y, 2.0) && near(p11.z, 0.0));
+    }
+
+    fn malformed(planes: &[Plane]) -> String {
+        let (buf, _) = plane_file(planes, (2, 2, 2, 4));
+        match Tzf::from_bytes(buf).unwrap().grid_points() {
+            Err(Error::Malformed(m)) => m,
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_plane_not_4_bytes_per_cell() {
+        let mut planes = two_line_planes();
+        planes[0].5.truncate(8); // 2x2 cells in 8 bytes: 2 per cell
+        assert!(malformed(&planes).contains("not 4 per cell"));
+        let mut planes = two_line_planes();
+        planes[2].5.truncate(8);
+        assert!(malformed(&planes).contains("not 4 per cell"));
+    }
+
+    #[test]
+    fn rejects_planes_of_different_sizes() {
+        let mut planes = two_line_planes();
+        planes[1].3 = 1; // vertical-angle plane 2x1, 4 bytes per cell
+        planes[1].5.truncate(8);
+        assert!(malformed(&planes).contains("range is 2x2"));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_missing_components() {
+        let mut planes = two_line_planes();
+        planes.push(planes[0].clone());
+        assert!(malformed(&planes).contains("two component 1 blocks"));
+        let mut planes = two_line_planes();
+        planes.remove(1);
+        assert!(malformed(&planes).contains("missing a component"));
+    }
+
+    #[test]
+    fn rejects_block_larger_than_tile() {
+        let (buf, m) = plane_file(&two_line_planes(), (2, 2, 2, 4));
+        let mut buf = buf;
+        buf[m + 0x38..m + 0x3c].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            Tzf::from_bytes(buf).unwrap().grid_points(),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    /// A declared point count of u32::MAX must not drive the allocation.
+    #[test]
+    fn ignores_huge_declared_point_count() {
+        let (buf, _) = plane_file(&two_line_planes(), (u32::MAX, u32::MAX, 2, u32::MAX));
+        let pts = Tzf::from_bytes(buf).unwrap().grid_points().unwrap();
+        assert_eq!(pts.len(), 4);
+    }
+
+    /// A descriptor claiming more raw bytes than its payload could ever expand
+    /// to is rejected before the output buffer is sized.
+    #[test]
+    fn rejects_impossible_raw_size() {
+        let mut buf = vec![0u8; FIRST_DESCRIPTOR];
+        buf[..8].copy_from_slice(&MAGIC);
+        let raw = 8192 * 8192 * 4u32;
+        let mut p = raw.to_le_bytes().to_vec();
+        p.extend_from_slice(&[0x78, 0x01, 0x03, 0x00]); // empty deflate stream
+        push_block(&mut buf, 1, (0, 0), 8192, 8192, raw, &p);
+        let end = buf.len() as u64;
+        buf[0x10..0x18].copy_from_slice(&end.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 0x40]);
+        let t = Tzf::from_bytes(buf).unwrap();
+        let b = t.blocks().next().unwrap();
+        assert_eq!(b.kind, BlockKind::Deflate);
+        let mut out = Vec::new();
+        assert!(matches!(t.decode_into(&b, &mut out), Err(Error::Decompress(_))));
+        assert_eq!(out.capacity(), 0);
+    }
+
+    /// Every truncation and every single-byte corruption of a valid file must
+    /// give `Ok` or `Err`, never a panic.
+    #[test]
+    fn truncated_or_corrupted_files_do_not_panic() {
+        let (buf, m) = plane_file(&two_line_planes(), (2, 2, 2, 4));
+        let try_all = |b: Vec<u8>| {
+            if let Ok(t) = Tzf::from_bytes(b) {
+                let _ = t.scan_meta();
+                let _ = t.grid_points();
+                for blk in t.blocks() {
+                    let _ = t.decode(&blk);
+                }
+            }
+        };
+        for len in 0..buf.len() {
+            try_all(buf[..len].to_vec());
+        }
+        for i in 0..buf.len() {
+            for x in [0xff, 0x80, 0x01] {
+                let mut b = buf.clone();
+                b[i] ^= x;
+                try_all(b);
+            }
+        }
+        // Truncated inside the plane data: the walker stops early and the
+        // tiles come up short.
+        let mut b = buf[..m - 10].to_vec();
+        b[0x10..0x18].copy_from_slice(&((m - 10) as u64).to_le_bytes());
+        b.extend_from_slice(&buf[m..]);
+        assert!(Tzf::from_bytes(b).unwrap().grid_points().is_err());
+    }
+
+    #[test]
+    fn reports_whether_levelling_was_applied() {
+        let (mut buf, m) = plane_file(&two_line_planes(), (2, 2, 2, 4));
+        let meta = |b: &[u8]| Tzf::from_bytes(b.to_vec()).unwrap().scan_meta().unwrap();
+        assert_eq!(meta(&buf).levelling, Levelling::NotARotation); // all zeros
+        for (k, v) in IDENTITY.iter().flatten().enumerate() {
+            let o = m + 0x44 + 8 * k;
+            buf[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(meta(&buf).levelling, Levelling::Applied);
+        assert!(meta(&buf).levelling.is_applied());
+        assert_eq!(meta(&buf[..m + 0x44]).levelling, Levelling::Missing);
+    }
+
+    /// The decoded points' azimuth atan2(y, x) is 2π − HA, where HA is the
+    /// instrument horizontal angle of the column (`ScanMeta::ha_of_col`).
+    #[test]
+    fn point_azimuth_is_two_pi_minus_ha() {
+        // Four columns from HA 1.0 rad in 0.5 rad steps. Like the metadata
+        // start angle, the plane stores each line's HA negated (µrad, the
+        // first cell absolute, the rest deltas).
+        let (start, step) = (1.0f64, 0.5f64);
+        let q = 1_570_796u32;
+        let ha = |c: u32| -((start + c as f64 * step) * 1e6).round() as i32 as u32;
+        let planes: Vec<Plane> = vec![
+            (COMPONENT_RANGE, (0, 0), 4, 1, 1.0, cells(&[1000; 4])),
+            (COMPONENT_VERTICAL_ANGLE, (0, 0), 4, 1, 1.0, cells(&[q; 4])),
+            (COMPONENT_HORIZONTAL_ANGLE, (0, 0), 4, 1, 1.0, cells(&[ha(0), ha(1), ha(2), ha(3)])),
+        ];
+        let (mut buf, m) = plane_file(&planes, (1, 4, 4, 4));
+        for (off, v) in [(0x10, step), (0x18, step), (0x28, -start)] {
+            buf[m + off..m + off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let t = Tzf::from_bytes(buf).unwrap();
+        let meta = t.scan_meta().unwrap();
+        let pts = t.grid_points().unwrap();
+        assert_eq!(pts.len(), 4);
+        for g in pts {
+            let az = (g.point.y as f64).atan2(g.point.x as f64).rem_euclid(std::f64::consts::TAU);
+            let ha = meta.ha_of_col(g.col as f64);
+            assert!((az - (std::f64::consts::TAU - ha)).abs() < 1e-5, "col {}", g.col);
+            assert!((az - meta.azimuth_of_col(g.col as f64)).abs() < 1e-5);
+            assert!((ha_to_azimuth(az) - ha).abs() < 1e-5);
+        }
     }
 
     #[test]
