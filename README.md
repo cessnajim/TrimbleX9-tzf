@@ -56,7 +56,7 @@ only X9 files have been tested.
 Rust 1.77 or later. Dependencies: `flate2`, `memmap2`, `thiserror`.
 
 ```bash
-git clone https://github.com/cessnajim/trimble-tzf
+git clone https://github.com/northidaholabs/trimble-tzf
 cd trimble-tzf
 cargo build --release          # target/release/tzfdump, target/release/tzf2ply
 cargo test
@@ -65,14 +65,14 @@ cargo test
 Install both binaries into `~/.cargo/bin`:
 
 ```bash
-cargo install --git https://github.com/cessnajim/trimble-tzf --tag v0.2.0
+cargo install --git https://github.com/northidaholabs/trimble-tzf --tag v0.2.0
 ```
 
 Use the library from another crate:
 
 ```toml
 [dependencies]
-trimble-tzf = { git = "https://github.com/cessnajim/trimble-tzf", tag = "v0.2.0" }
+trimble-tzf = { git = "https://github.com/northidaholabs/trimble-tzf", tag = "v0.2.0" }
 ```
 
 The crate is imported as `trimble_tzf`. Use `v0.2.0` or later: the `v0.1.0`
@@ -165,7 +165,7 @@ with the scanner at the origin (see [Coordinates](#coordinates)).
 **Intensity from the scanner's preview.** The per-tile intensity JPEGs
 (component 4) are located but not decoded yet. The scanner's panoramic preview image (served by the
 scanner's HTTP API next to each scan file, e.g. via
-[TrimbleX9-mcp](https://github.com/cessnajim/TrimbleX9-mcp)'s
+[TrimbleX9-mcp](https://github.com/northidaholabs/TrimbleX9-mcp)'s
 `scanner_download_preview`) is aligned with the
 grid and can stand in. On full-dome scans it is about half the grid size
 (e.g. 2082 × 815 for a 4165 × 1631 grid), so scale it to exactly
