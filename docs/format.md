@@ -57,9 +57,7 @@ order of components within a tile varies. Tile (r, c) covers grid rows
 `512·r … 512·r+511` and columns `512·c … 512·c+511`, clipped at the grid edge.
 
 **Cells** in components 1–3 are 4 bytes. `0` and `0xFFFFFFFF` appear as
-no‑data values. The meaning of each of components 1–3 is *unknown* (one sample
-tile of component 2 holds small bounded values 0..1952; others span the full
-u32 range).
+no‑data values. Components 1–3 are range, vertical angle and horizontal angle; see below.
 
 ## Metadata block (at `sections[0]`)
 
@@ -88,8 +86,90 @@ scans have the same layout with a smaller grid.
 - One section begins with `FF D8 FF E0 … JFIF`: an embedded preview JPEG.
 - Others hold small directories and an `f32` array; their roles are *unknown*.
 
-## Still to work out (for XYZ)
-1. What each of components 1–3 encodes, and the cell → range scale.
-2. Grid cell → (horizontal angle, vertical angle) origin and direction, then
-   spherical → XYZ and any leveling correction, and export to LAS/PLY.
-3. Cell order inside a 512×512 tile (row‑major is assumed; unconfirmed).
+## Components 1–3: range and measured angles
+
+Worked out on scans recorded for this project (see `PROVENANCE.md`), by
+commanding scans with known parameters and checking the decoded values against
+them and against flat surfaces.
+
+| Component | Cell type | Meaning |
+|---|---|---|
+| 1 | u32 | **Range.** Metres = value / scale / 1000, where scale is the descriptor's f32 at offset 48 (10.0 on samples, so 0.1 mm units). `0` = no return. |
+| 2 | u32 / i32 | **Vertical angle**, µrad from the zenith. |
+| 3 | u32 / i32 | **Horizontal angle**, µrad, stored negated (same sign as metadata `0x28`). |
+
+**Cell order inside a tile is column-major.** Cell `line × height + k` is grid
+column `512·tile_col + line` and row `512·tile_row + k`: each run of `height`
+cells is one vertical scan line. (This replaces the earlier row-major
+assumption.)
+
+**Angle planes are delta-coded per line.** The first cell of each line holds
+the absolute angle; every following cell holds a signed `i32` difference from
+the previous cell. Integrate along the line, including across empty cells.
+Values that look like huge `u32`s are negative deltas. The angles are the
+instrument's measured angles per point, not an ideal grid.
+
+Evidence (area scan commanded at start VA 1.261 rad, start HA 5.163 rad,
+STD_L2, 905 × 874 cells):
+- Component 2's first cells read 1,261,058 µrad; steps are ~503 µrad, matching
+  the metadata angle step (5.029e‑4 rad).
+- Component 3's first cells read −5,162,788 µrad, matching the negated start HA.
+- Component 1 equals 10 × the full-grid `f32` range plane (below) in every cell
+  (correlation 1.0000).
+
+**To XYZ** (right-handed, metres), with `va`, `ha` the integrated angles in
+radians and `r` the range:
+
+```
+x = r·sin(va)·cos(ha)    y = r·sin(va)·sin(ha)    z = r·cos(va)
+```
+
+## Levelling (tilt)
+
+The metadata block holds a 3×3 rotation at offset `0x44` (nine `f64`,
+row-major). Its off-diagonal terms match the two leveling-compensator readings
+the scanner reports over its HTTP status endpoint while the scan is taken
+(e.g. 0.01545 and 0.02297 rad). Level each point with **p′ = Rᵀ · p**.
+
+Evidence: applying Rᵀ brings a wall from 0.33° off plumb to 0.04° (area scan)
+and a floor to 0.04° from level (full-dome scan). R, and the mirrored variants
+S·R·S and S·Rᵀ·S (S = diag(1, −1, 1)), all make the result worse.
+
+## Snappy payloads (full-dome scans, current firmware)
+
+On full-dome scans recorded in 2026, components 1–3 are not Deflate. The
+payload begins directly with a raw **Snappy** block (public block format, no
+framing): its leading varint is the raw size (`80 80 40` = 1,048,576), and
+decoding it yields exactly that many bytes. The descriptor's length rule is
+unchanged (payload = L − 28). Planes, cell order and angle coding are the same
+as above.
+
+## Full-grid planes after the metadata
+
+Area scans also carry three `rows × cols × 4` raw-DEFLATE blocks after the
+metadata block (scale 1.0): range as `f32` millimetres (exactly `nbPoints`
+finite cells), and the two angles as `f32` bit patterns with integer deltas.
+They duplicate components 1–3.
+
+## Intensity (component 4)
+
+Component 4 is the **laser intensity image** for its tile: a baseline
+512 × 512 8-bit grayscale JPEG. Unlike components 1–3 it is stored **row-major,
+upright**: JPEG pixel (x, y) is grid column `512·tile_col + x`, row
+`512·tile_row + y`.
+
+Evidence: in the full-dome scan (36 tiles, one JPEG each), tile (1, 4)
+downsampled 2× correlates 0.87 with the matching region of the scanner's
+preview image; transposed or flipped, it correlates 0.12 or less.
+
+Not every scan carries it: the color-off area scan has no component 4, while
+the color-on full-dome scan does. Whether color mode is what controls it is
+not yet confirmed. When it is absent, the scanner's preview image is
+grid-aligned and can supply intensity (`tzf2ply --intensity-pgm`).
+
+## Validation summary
+
+| Scan | Points decoded / declared | Check |
+|---|---|---|
+| Area, STD_L2, color off, 905 × 874, Deflate | 777,580 / 777,580 | wall plane fit 1.2 mm RMS; plumb to 0.04° after levelling |
+| Full dome, STD_L0, color on, 4165 × 1631, Snappy + JPEG intensity | 6,281,859 / 6,281,859 | floor plane fit 2.0 mm RMS; level to 0.04° after levelling |

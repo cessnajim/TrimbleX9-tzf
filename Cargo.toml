@@ -17,6 +17,10 @@ name = "tzf"
 name = "tzfdump"
 path = "src/bin/tzfdump.rs"
 
+[[bin]]
+name = "tzf2ply"
+path = "src/bin/tzf2ply.rs"
+
 [dependencies]
 flate2 = "1"
 memmap2 = "0.9"

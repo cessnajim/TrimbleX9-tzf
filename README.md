@@ -11,7 +11,7 @@ contains no vendor source, firmware, or binaries, and is **not affiliated with
 or endorsed by Trimble Inc.**; "Trimble", "X7", "X9" are trademarks of their
 respective owners.
 
-## Status: work in progress
+## Status
 
 | Piece | State |
 |---|---|
@@ -19,11 +19,13 @@ respective owners.
 | Scan metadata (grid, angle steps, tile size, point count) | ✅ `Tzf::scan_meta` |
 | Deterministic block walk (lazy, allocation‑free) | ✅ `Tzf::blocks` |
 | Tile placement (row, col per block) | ✅ `Block::tile_row` / `tile_col` |
-| Block decode (raw‑deflate 512×512×4; JPEG payloads) | ✅ `Tzf::decode` / `decode_into` / `payload` |
-| Meaning of components 1–3, range scale | ⬜ TODO |
-| Spherical → XYZ, LAS/PLY export | ⬜ TODO |
+| Block decode (raw DEFLATE or raw Snappy 512×512×4; JPEG payloads) | ✅ `Tzf::decode` / `decode_into` / `payload` |
+| Components 1–3: range, vertical angle, horizontal angle | ✅ `docs/format.md` |
+| Spherical → XYZ with levelling | ✅ `Tzf::points` / `grid_points` |
+| PLY / LAS export | ✅ `tzf2ply` |
+| Intensity | 🟡 located (component 4 JPEG, see `docs/format.md`); not decoded yet, so `tzf2ply --intensity-pgm` takes the scanner preview |
 
-Until the decode path lands, `Tzf::points()` returns `Error::Unimplemented`.
+Validated on area and full-dome X9 scans: every declared point decodes, walls are flat to 1–2 mm RMS and plumb to 0.04° after levelling. How the format was worked out: `docs/PROVENANCE.md`.
 
 **Memory:** files are memory‑mapped and blocks decode on demand into a reusable
 buffer, so working memory is about one decoded block (1 MiB) plus the mapped
@@ -35,6 +37,7 @@ pages actually read. This keeps a Raspberry Pi in budget.
 cargo run --bin tzfdump -- scan.tzf            # header, sections, scan metadata
 cargo run --bin tzfdump -- scan.tzf --blocks   # block summary (decodes nothing)
 cargo run --bin tzfdump -- scan.tzf --verify   # decode every block once
+tzf2ply scan.tzf out --intensity-pgm preview.pgm  # out.ply + out.las
 cargo test
 ```
 

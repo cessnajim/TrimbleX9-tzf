@@ -12,10 +12,11 @@
 //! The file is memory‑mapped and [`Tzf::blocks`] is a lazy, allocation‑free
 //! iterator; payloads are only decompressed when you ask for one.
 //!
-//! STATUS: **work in progress.** Header, metadata, block walk, tile placement
-//! and block decode are implemented. The meaning of components 1–3, the range
-//! scale and spherical→XYZ are still being worked out, so [`Tzf::points`]
-//! returns [`Error::Unimplemented`].
+//! Components 1–3 of each tile are range, vertical angle and horizontal angle
+//! (component 4, when present, is a JPEG intensity image);
+//! [`Tzf::points`] turns them into levelled XYZ (see `docs/format.md`).
+//! Payloads are raw DEFLATE or raw Snappy blocks. Validated on X9 scans
+//! recorded for this project (`docs/PROVENANCE.md`).
 
 use memmap2::Mmap;
 use std::fs::File;
@@ -105,6 +106,29 @@ pub struct ScanMeta {
     pub start_ha_rad: f64,
     /// Vertical angle of the first grid row (radians from the zenith).
     pub start_va_rad: f64,
+    /// Levelling rotation stored at metadata offset 0x44 (row-major 3×3 f64).
+    /// Points are levelled with `p' = tiltᵀ · p`. Identity when the stored
+    /// matrix is absent or not a proper rotation.
+    pub tilt: [[f64; 3]; 3],
+}
+
+const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Accept a 3×3 matrix only if it is a proper rotation (orthonormal, det +1).
+fn as_rotation(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    for i in 0..3 {
+        for j in 0..3 {
+            let dot: f64 = (0..3).map(|k| m[i][k] * m[j][k]).sum();
+            let want = if i == j { 1.0 } else { 0.0 };
+            if !dot.is_finite() || (dot - want).abs() > 1e-6 {
+                return None;
+            }
+        }
+    }
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    ((det - 1.0).abs() < 1e-6).then_some(m)
 }
 
 impl ScanMeta {
@@ -119,11 +143,21 @@ impl ScanMeta {
     }
 }
 
+/// Component number of the range plane (see [`Tzf::points`]).
+pub const COMPONENT_RANGE: u32 = 1;
+/// Component number of the vertical-angle plane.
+pub const COMPONENT_VERTICAL_ANGLE: u32 = 2;
+/// Component number of the horizontal-angle plane.
+pub const COMPONENT_HORIZONTAL_ANGLE: u32 = 3;
+
 /// How a block's payload is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
     /// `[u32 raw size][0x78 0x01][raw DEFLATE]` — decode with [`Tzf::decode`].
     Deflate,
+    /// A raw Snappy block (public block format, no framing) whose declared
+    /// length equals the raw size — decode with [`Tzf::decode`].
+    Snappy,
     /// A baseline JPEG (`FF D8 FF …`) — read with [`Tzf::payload`].
     Jpeg,
     /// Anything else (not seen on samples).
@@ -215,6 +249,15 @@ impl Tzf {
             grid_cols: rd_u32(d, m + 0x34),
             tile_size: rd_u32(d, m + 0x38),
             n_points: rd_u32(d, m + 0x3c),
+            tilt: if m + 0x44 + 72 <= d.len() {
+                let mut t = [[0.0; 3]; 3];
+                for (k, v) in t.iter_mut().flatten().enumerate() {
+                    *v = rd_f64(d, m + 0x44 + 8 * k);
+                }
+                as_rotation(t).unwrap_or(IDENTITY)
+            } else {
+                IDENTITY
+            },
         })
     }
 
@@ -238,9 +281,14 @@ impl Tzf {
         &self.bytes()[b.payload_start..b.payload_end]
     }
 
-    /// Decode a `Deflate` block into `out` (reused across calls to avoid
-    /// reallocating). On success `out.len() == b.raw_size`.
+    /// Decode a `Deflate` or `Snappy` block into `out` (reused across calls to
+    /// avoid reallocating). On success `out.len() == b.raw_size`.
     pub fn decode_into(&self, b: &Block, out: &mut Vec<u8>) -> Result<()> {
+        if b.kind == BlockKind::Snappy {
+            return snappy_decompress_into(self.payload(b), b.raw_size as usize, out).map_err(|_| {
+                Error::Decompress(format!("snappy block at 0x{:x} did not decode", b.descriptor))
+            });
+        }
         if b.kind != BlockKind::Deflate {
             return Err(Error::WrongKind {
                 offset: b.descriptor,
@@ -266,20 +314,103 @@ impl Tzf {
         Ok(())
     }
 
-    /// Decode a `Deflate` block into a fresh buffer.
+    /// Decode a `Deflate` or `Snappy` block into a fresh buffer.
     pub fn decode(&self, b: &Block) -> Result<Vec<u8>> {
         let mut v = Vec::new();
         self.decode_into(b, &mut v)?;
         Ok(v)
     }
 
-    /// Decode all points. TODO: component meaning + range scale +
-    /// spherical→XYZ + leveling. See `docs/format.md`.
+    /// Decode all valid points (metres, levelled scanner frame: +z is up).
+    /// `intensity` is 0: the intensity image (component 4, a JPEG per tile,
+    /// present only in some scans) is not decoded yet; the scanner's preview
+    /// image is grid-aligned and can supply it.
     pub fn points(&self) -> Result<Vec<Point>> {
-        Err(Error::Unimplemented(
-            "points: component meaning + placement + geometry (WIP)",
-        ))
+        Ok(self.grid_points()?.into_iter().map(|g| g.point).collect())
     }
+
+    /// Like [`Tzf::points`], but each point also carries its grid cell.
+    ///
+    /// Per tile, components 1/2/3 hold range / vertical angle / horizontal
+    /// angle. Cells are stored one vertical scan line at a time: cell
+    /// `line × height + k` is grid column `tile_col × tile + line`, row
+    /// `tile_row × tile + k`. Angle planes hold µrad: the first cell of each
+    /// line is absolute, the rest are `i32` deltas. Range = value / scale / 1000 m.
+    pub fn grid_points(&self) -> Result<Vec<GridPoint>> {
+        use std::collections::BTreeMap;
+        let meta = self.scan_meta()?;
+        let (rows, cols, tile) = (meta.grid_rows as usize, meta.grid_cols as usize, meta.tile_size as usize);
+        let mut tiles: BTreeMap<(u32, u32), [Option<Block>; 3]> = BTreeMap::new();
+        for b in self.blocks() {
+            let slot = match b.component {
+                COMPONENT_RANGE => 0,
+                COMPONENT_VERTICAL_ANGLE => 1,
+                COMPONENT_HORIZONTAL_ANGLE => 2,
+                _ => continue,
+            };
+            tiles.entry((b.tile_row, b.tile_col)).or_default()[slot] = Some(b);
+        }
+        if tiles.is_empty() {
+            return Err(Error::Decompress("no range/angle blocks found".into()));
+        }
+        let t = meta.tilt;
+        let mut out = Vec::with_capacity(meta.n_points as usize);
+        let (mut rb, mut vb, mut hb) = (Vec::new(), Vec::new(), Vec::new());
+        for (&(tr, tc), p) in &tiles {
+            let [Some(r), Some(v), Some(h)] = p else {
+                return Err(Error::Decompress(format!("tile ({tr},{tc}) is missing a component")));
+            };
+            self.decode_into(r, &mut rb)?;
+            self.decode_into(v, &mut vb)?;
+            self.decode_into(h, &mut hb)?;
+            let (lines, per_line) = (r.width as usize, r.height as usize);
+            let cell = |buf: &[u8], i: usize| rd_u32(buf, i * 4);
+            for line in 0..lines {
+                let col = tc as usize * tile + line;
+                if col >= cols {
+                    break;
+                }
+                let (mut va_u, mut ha_u) = (0i64, 0i64);
+                for k in 0..per_line {
+                    let i = line * per_line + k;
+                    // Integrate before the validity checks so the running angle
+                    // stays correct across empty cells.
+                    va_u += cell(&vb, i) as i32 as i64;
+                    ha_u += cell(&hb, i) as i32 as i64;
+                    let row = tr as usize * tile + k;
+                    let raw = cell(&rb, i);
+                    if row >= rows || raw == 0 || raw == u32::MAX {
+                        continue;
+                    }
+                    let range = raw as f64 / r.scale as f64 / 1000.0;
+                    let (va, ha) = (va_u as f64 * 1e-6, ha_u as f64 * 1e-6);
+                    let hz = range * va.sin();
+                    let (x, y, z) = (hz * ha.cos(), hz * ha.sin(), range * va.cos());
+                    // p' = tiltᵀ · p
+                    out.push(GridPoint {
+                        point: Point {
+                            x: (t[0][0] * x + t[1][0] * y + t[2][0] * z) as f32,
+                            y: (t[0][1] * x + t[1][1] * y + t[2][1] * z) as f32,
+                            z: (t[0][2] * x + t[1][2] * y + t[2][2] * z) as f32,
+                            intensity: 0.0,
+                        },
+                        row: row as u32,
+                        col: col as u32,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|g| (g.col, g.row));
+        Ok(out)
+    }
+}
+
+/// A point plus the grid cell it came from (`col` = horizontal, `row` = vertical).
+#[derive(Debug, Clone, Copy)]
+pub struct GridPoint {
+    pub point: Point,
+    pub row: u32,
+    pub col: u32,
 }
 
 /// A decoded point (metres, scanner frame) with intensity.
@@ -347,6 +478,8 @@ fn parse_block(d: &[u8], at: usize, end: usize) -> Option<Block> {
         BlockKind::Deflate
     } else if p.len() >= 3 && p[..3] == [0xff, 0xd8, 0xff] {
         BlockKind::Jpeg
+    } else if snappy_declared_len(p) == Some(raw as usize) {
+        BlockKind::Snappy
     } else {
         BlockKind::Unknown
     };
@@ -363,6 +496,91 @@ fn parse_block(d: &[u8], at: usize, end: usize) -> Option<Block> {
         scale: f32::from_bits(rd_u32(d, at + 48)),
         kind,
     })
+}
+
+/// The uncompressed length a raw Snappy block declares (its leading varint).
+fn snappy_declared_len(buf: &[u8]) -> Option<usize> {
+    let (mut len, mut shift) = (0usize, 0);
+    for &b in buf.iter().take(5) {
+        len |= ((b & 0x7f) as usize) << shift;
+        if b < 0x80 {
+            return Some(len);
+        }
+        shift += 7;
+    }
+    None
+}
+
+/// Decompress a raw Snappy block (public block format: a varint length, then
+/// literal / copy elements) into `out`; succeed only if it declares and yields
+/// exactly `expect` bytes.
+fn snappy_decompress_into(buf: &[u8], expect: usize, out: &mut Vec<u8>) -> std::result::Result<(), ()> {
+    let byte = |p: usize| buf.get(p).copied().ok_or(());
+    let le = |p: usize, n: usize| -> std::result::Result<usize, ()> {
+        let b = buf.get(p..p + n).ok_or(())?;
+        Ok(b.iter().rev().fold(0usize, |a, &x| a << 8 | x as usize))
+    };
+    let (mut len, mut pos, mut shift) = (0usize, 0usize, 0);
+    loop {
+        let b = byte(pos)?;
+        pos += 1;
+        len |= ((b & 0x7f) as usize) << shift;
+        if b < 0x80 {
+            break;
+        }
+        shift += 7;
+        if shift > 28 {
+            return Err(());
+        }
+    }
+    if len != expect {
+        return Err(());
+    }
+    out.clear();
+    out.reserve(len);
+    while out.len() < len {
+        let tag = byte(pos)?;
+        pos += 1;
+        let (n, off) = match tag & 3 {
+            0 => {
+                let mut n = (tag >> 2) as usize;
+                if n >= 60 {
+                    let w = n - 59;
+                    n = le(pos, w)?;
+                    pos += w;
+                }
+                let lit = buf.get(pos..pos + n + 1).ok_or(())?;
+                if out.len() + lit.len() > len {
+                    return Err(());
+                }
+                out.extend_from_slice(lit);
+                pos += n + 1;
+                continue;
+            }
+            1 => {
+                let o = ((tag as usize >> 5) << 8) | byte(pos)? as usize;
+                pos += 1;
+                (((tag >> 2) & 7) as usize + 4, o)
+            }
+            2 => {
+                pos += 2;
+                ((tag >> 2) as usize + 1, le(pos - 2, 2)?)
+            }
+            _ => {
+                pos += 4;
+                ((tag >> 2) as usize + 1, le(pos - 4, 4)?)
+            }
+        };
+        if off == 0 || off > out.len() || out.len() + n > len {
+            return Err(());
+        }
+        let start = out.len() - off;
+        for k in 0..n {
+            let v = out[start + k]; // copies may overlap their own output
+            out.push(v);
+        }
+    }
+    Ok(())
 }
 
 fn rd_u32(d: &[u8], o: usize) -> u32 {
@@ -472,6 +690,62 @@ mod tests {
         // 5.0 + 1000 * 1.5e-3 = 6.5 rad wraps past 2π
         let wrapped = 6.5 - std::f64::consts::TAU;
         assert!((meta.ha_of_col(1000.0) - wrapped).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snappy_literals_and_overlapping_copy() {
+        // len 7; literal "ab"; copy-1 (len 5, offset 2) -> "abababa".
+        let buf = [7u8, 0x04, b'a', b'b', 1 << 2 | 1, 2];
+        let mut out = Vec::new();
+        snappy_decompress_into(&buf, 7, &mut out).unwrap();
+        assert_eq!(&out, b"abababa");
+        assert!(snappy_decompress_into(&buf, 8, &mut out).is_err());
+        assert_eq!(snappy_declared_len(&[0x80, 0x80, 0x40]), Some(1 << 20));
+    }
+
+    #[test]
+    fn tilt_guard_accepts_rotations_only() {
+        let (c, sn) = (0.02f64.cos(), 0.02f64.sin());
+        assert!(as_rotation([[c, 0.0, sn], [0.0, 1.0, 0.0], [-sn, 0.0, c]]).is_some());
+        assert!(as_rotation([[0.0; 3]; 3]).is_none());
+        assert!(as_rotation([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]).is_none());
+    }
+
+    /// One 2x2 tile: two vertical lines at HA 0 and 90°, both rows at VA 90°
+    /// (horizontal), range 1 m and 2 m. Expect points on +x and +y.
+    #[test]
+    fn decodes_points_from_planes() {
+        let mut buf = vec![0u8; FIRST_DESCRIPTOR];
+        buf[..8].copy_from_slice(&MAGIC);
+        let q = 1_570_796u32; // π/2 in µrad
+        let planes: [(u32, f32, [u32; 4]); 3] = [
+            (COMPONENT_RANGE, 10.0, [10_000, 20_000, 10_000, 20_000]),
+            (COMPONENT_VERTICAL_ANGLE, 1.0, [q, 0, q, 0]),
+            (COMPONENT_HORIZONTAL_ANGLE, 1.0, [0, 0, q, 0]),
+        ];
+        for (comp, scale, cells) in planes {
+            let raw: Vec<u8> = cells.iter().flat_map(|c| c.to_le_bytes()).collect();
+            let mut p = (raw.len() as u32).to_le_bytes().to_vec();
+            p.extend_from_slice(&[0x78, 0x01]);
+            p.extend_from_slice(&deflate_raw(&raw));
+            push_block(&mut buf, comp, (0, 0), 2, 2, raw.len() as u32, &p);
+            let at = buf.len() - p.len() - DESCRIPTOR_LEN;
+            buf[at + 48..at + 52].copy_from_slice(&scale.to_le_bytes());
+        }
+        let m = buf.len();
+        buf[0x10..0x18].copy_from_slice(&(m as u64).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 0x40 + 72]);
+        buf[m + 0x30..m + 0x34].copy_from_slice(&2u32.to_le_bytes());
+        buf[m + 0x34..m + 0x38].copy_from_slice(&2u32.to_le_bytes());
+        buf[m + 0x38..m + 0x3c].copy_from_slice(&2u32.to_le_bytes());
+        buf[m + 0x3c..m + 0x40].copy_from_slice(&4u32.to_le_bytes());
+        let pts = Tzf::from_bytes(buf).unwrap().grid_points().unwrap();
+        assert_eq!(pts.len(), 4);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let p00 = pts[0].point; // col 0, row 0: 1 m along +x
+        assert!(near(p00.x, 1.0) && near(p00.y, 0.0) && near(p00.z, 0.0));
+        let p11 = pts[3].point; // col 1, row 1: 2 m along +y
+        assert!(near(p11.x, 0.0) && near(p11.y, 2.0) && near(p11.z, 0.0));
     }
 
     #[test]

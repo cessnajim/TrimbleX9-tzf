@@ -103,7 +103,7 @@ fn main() -> ExitCode {
         let (mut ok, mut bad, mut jpeg_ok, mut jpeg_bad) = (0, 0, 0, 0);
         for b in tzf.blocks() {
             match b.kind {
-                BlockKind::Deflate => match tzf.decode_into(&b, &mut buf) {
+                BlockKind::Deflate | BlockKind::Snappy => match tzf.decode_into(&b, &mut buf) {
                     Ok(()) => ok += 1,
                     Err(e) => {
                         bad += 1;
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
                 BlockKind::Unknown => bad += 1,
             }
         }
-        println!("verify    : deflate {ok} ok / {bad} failed; jpeg {jpeg_ok} ok / {jpeg_bad} bad");
+        println!("verify    : deflate/snappy {ok} ok / {bad} failed; jpeg {jpeg_ok} ok / {jpeg_bad} bad");
         if bad > 0 || jpeg_bad > 0 {
             return ExitCode::FAILURE;
         }
